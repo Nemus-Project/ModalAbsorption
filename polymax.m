@@ -97,6 +97,21 @@ cprev = [];
 fst   = [];
 cst   = [];
 
+% Draw the spectrum background once before the order sweep so that poles
+% from every iteration accumulate on top of it without being erased.
+if LivePlot == 1
+    hold on;
+    fill([fv(:); flipud(fv(:))], ...
+         [spc_dB(:); (minSpc - 15)*ones(Lfv, 1)], ...
+         [0.88 0.88 0.88], 'EdgeColor', 'none', 'FaceAlpha', 0.8);
+    plot(fv, spc_dB, 'Color', [0.3 0.3 0.3], 'LineWidth', 0.7);
+    xlim([fv(1), fv(end)]);
+    ylim([minSpc - 5, maxSpc + 5]);
+    xlabel('$f$ (Hz)', 'Interpreter', 'latex', 'FontSize', 11);
+    ylabel('$|\hat{H}|$ (dB)', 'Interpreter', 'latex', 'FontSize', 11);
+    drawnow;
+end
+
 % =========================================================================
 %  Main PolyMax loop — sweep polynomial order
 % =========================================================================
@@ -106,21 +121,29 @@ for Nopt0 = NorderMin : orderstep : NorderMax
     % Rescale time step as per PolyMax normalisation (Guillaume et al.)
     k = 1 / (fend - fstart) / 2;
 
-    % Build regression matrices X (denominator basis) and Y (numerator coupling)
-    X = zeros(Lfv, Nopt0 + 1);
-    Y = zeros(Lfv, Nopt0);
-    d = zeros(Lfv, 1);
-    for n = 1 : Lfv
-        z      = exp(-1j * omv(n) * k);   % z-domain sample
-        mH     = -fftinput(n);             % negated FRF sample
-        for m = 0 : Nopt0
-            X(n, m+1) = z^m;
-        end
-        for m = 0 : Nopt0 - 1
-            Y(n, m+1) = mH * z^m;
-        end
-        d(n) = z^Nopt0 * mH;
-    end
+    % Build regression matrices X (denominator basis) and Y (numerator coupling).
+    %
+    % The basis is Vandermonde-like in z = exp(-jω·k).  Rather than the
+    % original nested loop over (n, m), we build the matrix in one shot:
+    %
+    %   zvec(n) = exp(-j·omv(n)·k)                          [Lfv×1]
+    %   Zpow    = cumprod([1, zvec, zvec², …, zvec^Nopt0])   [Lfv×(Nopt0+1)]
+    %   X(n,m+1) = zvec(n)^m  =  Zpow(n, m+1)
+    %   Y(n,m+1) = -H(n) · zvec(n)^m  =  mHvec(n) · Zpow(n, m+1)
+    %   d(n)     = -H(n) · zvec(n)^Nopt0
+    %
+    % cumprod along columns avoids Nopt0 redundant exp() calls per row and
+    % replaces O(Lfv·Nopt0) interpreted iterations with compiled array ops.
+
+    zvec  = exp(-1j * omv * k);                          % Lfv×1
+    mHvec = -fftinput(:);                                % Lfv×1
+
+    % Vandermonde columns: z^0, z^1, …, z^Nopt0
+    Zpow  = cumprod([ones(Lfv, 1), repmat(zvec, 1, Nopt0)], 2);  % Lfv×(Nopt0+1)
+
+    X = Zpow;                                            % Lfv×(Nopt0+1)
+    Y = mHvec .* Zpow(:, 1:Nopt0);                      % Lfv×Nopt0
+    d = mHvec .* Zpow(:, Nopt0+1);                      % Lfv×1
 
     % Normal equations
     rXX = real(X'*X);
@@ -235,26 +258,13 @@ for Nopt0 = NorderMin : orderstep : NorderMax
     % -----------------------------------------------------------------
     %  Live stability diagram (optional)
     % -----------------------------------------------------------------
-    if LivePlot == 1
-        cla; hold on;
-        fill([fv(:); flipud(fv(:))], ...
-             [spc_dB(:); (minSpc - 15)*ones(Lfv, 1)], ...
-             [0.88 0.88 0.88], 'EdgeColor', 'none', 'FaceAlpha', 0.8);
-        plot(fv, spc_dB, 'Color', [0.3 0.3 0.3], 'LineWidth', 0.7);
-
-        if indst > 0
-            plotInd = plotInd + 1;
-            frac = (Nopt0 - NorderMin) / max(NorderMax - NorderMin, 1);
-            col  = [frac, 0.2, 1 - frac];   % blue → red gradient
-            plot(fst, LineLevels(min(plotInd, end)) * ones(indst, 1), ...
-                'LineStyle', 'none', 'Marker', 'x', ...
-                'Color', col, 'MarkerSize', 5, 'LineWidth', 1.2);
-        end
-
-        xlim([fv(1), fv(end)]);
-        ylim([minSpc - 5, maxSpc + 5]);
-        xlabel('$f$ (Hz)', 'Interpreter', 'latex', 'FontSize', 11);
-        ylabel('$|\hat{H}|$ (dB)', 'Interpreter', 'latex', 'FontSize', 11);
+    if LivePlot == 1 && indst > 0
+        plotInd = plotInd + 1;
+        frac = (Nopt0 - NorderMin) / max(NorderMax - NorderMin, 1);
+        col  = [frac, 0.2, 1 - frac];   % blue → red gradient
+        plot(fst, LineLevels(min(plotInd, end)) * ones(indst, 1), ...
+            'LineStyle', 'none', 'Marker', 'x', ...
+            'Color', col, 'MarkerSize', 5, 'LineWidth', 1.2);
         title(sprintf('Order %d/%d  |  stable this step: %d  |  total: %d', ...
             Nopt0, NorderMax, indst, cumPoles), 'FontSize', 9);
         drawnow;

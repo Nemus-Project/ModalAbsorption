@@ -19,13 +19,19 @@
 %   2.  Compute acoustic indices (onset alignment, T30, C80, BR, TR).
 %   3.  Compute the half-spectrum via FFT.
 %   4.  Auto-estimate the Schroeder transition frequency if not set.
-%   5.  Divide the analysis range into octave / third-octave / custom bands.
-%   6.  Run PolyMax (LF) or peak-picking (HF) per band.
+%   5.  Build two independent band grids:
+%         • Processing bands — narrow linear bands of fixed Hz width.
+%           PolyMax / peak-picking runs on these; small bandwidths keep
+%           polynomial orders tractable regardless of bandMode.
+%         • Display bands — exact ISO 266 octave or third-octave bands.
+%           All statistics, console output, and figures use these.
+%   6.  Run PolyMax (LF) or peak-picking (HF) per processing band.
 %   7.  Least-squares amplitude solve; gain-outlier rejection.
 %   8.  Optional iterative residual refinement.
 %   9.  Optional FIR correction filter.
-%  10.  Compute per-band statistics, print summary, produce plots.
-%  11.  Save results and normalised synthetic RIR.
+%  10.  Remap poles from processing bands to display bands; compute stats.
+%  11.  Print summary and produce plots (in display-band resolution).
+%  12.  Save results and normalised synthetic RIR.
 %
 % DEPENDENCIES
 %   Signal Processing Toolbox        (filtfilt, designfilt, findpeaks)
@@ -40,9 +46,17 @@ clear; close all; clc;
 
 %% ========================== USER PARAMETERS ==============================
 
-% --- File -----------------------------------------------------------------
-filename  = 'Tonga Saint Gobain S1R01 001';
-inputPath = './measured_IRs/St Gobain';
+% --- Input folder ---------------------------------------------------------
+%   INPUTFOLDER is the directory containing all .wav files to process.
+%   Every .wav file found directly inside this folder will be analysed in
+%   sequence.  The folder's base name is used as a subfolder within
+%   outRootDir so that results from different measurement sets (empty room,
+%   with specimen, etc.) are kept strictly separate.
+%
+%   Example layout:
+%     ./measured_IRs/empty/    → results in outRootDir/empty/
+%     ./measured_IRs/specimen/ → results in outRootDir/St Gobain/
+inputFolder = './measured_IRs/St Gobain';
 
 % --- Input normalisation --------------------------------------------------
 normaliseInput = true;
@@ -51,10 +65,17 @@ normaliseInput = true;
 fLow  = 20;
 fHigh = 12000;
 
-% --- Band subdivision -----------------------------------------------------
+% --- Band subdivision — DISPLAY -------------------------------------------
+%   Controls the ISO band resolution used for all statistics and plots.
 %   'thirdOctave' | 'fullOctave' | 'custom'
 bandMode        = 'thirdOctave';
 customBandEdges = [50 100 200 400 800 1600 3200 4000];  % used only for 'custom'
+
+% --- Band subdivision — PROCESSING ----------------------------------------
+%   PolyMax runs on narrow linear bands of this fixed width [Hz].
+%   Smaller values → lower polynomial orders → faster, more stable fits.
+%   Must be wider than a few FFT bins; a value between 20–100 Hz works well.
+procBandWidth_Hz = 25;   % [Hz]  linear processing band width
 
 % --- Room geometry --------------------------------------------------------
 V_room  = 150;   % [m^3]
@@ -65,7 +86,7 @@ c_sound = 343;   % [m/s]
 %   Above fTransition: spectral peak-picking with Schroeder T30 damping.
 %   Set to [] for automatic computation: 2000 * sqrt(T60_mid / V_room),
 %   where T60_mid is the mean T60 in the 500–1000 Hz range from acoustic_indices.
-fTransition = 300;   % [Hz]
+fTransition = [];   % [Hz]
 
 % --- PolyMax order cap (LF bands only) ------------------------------------
 %   Order driven by mode count; Nbins/4 cap kicks in before maxPolyOrderLF
@@ -78,16 +99,16 @@ maxPolyIters = 100;
 
 % --- HF peak-picking (f >= fTransition) ----------------------------------
 minPeakProm_dB = 0.5;   % [dB]  minimum peak prominence
-minPeakDist_Hz = 0.25;   % [Hz]  minimum inter-peak spacing
+minPeakDist_Hz = 0.5;   % [Hz]  minimum inter-peak spacing
 
 % --- PolyMax stability tolerances -----------------------------------------
-tolf_init   = 0.02;   % relative frequency tolerance, initial pass
+tolf_init   = 0.05;   % relative frequency tolerance, initial pass
 told_init   = 0.10;   % relative damping  tolerance, initial pass
-tolf_refine = 0.02;   % relative frequency tolerance, refinement passes
+tolf_refine = 0.05;   % relative frequency tolerance, refinement passes
 told_refine = 0.10;   % relative damping  tolerance, refinement passes
 
 % --- T60 rejection ceiling ------------------------------------------------
-T60cutMult  = 3.0;    % T60cut = T60cutMult × T60est  (per band)
+T60cutMult  = 1.5;    % T60cut = T60cutMult × T60est  (per band)
 T60cutFloor = 5.0;    % [s]  minimum allowable T60cut
 
 % --- Live stabilisation diagram -------------------------------------------
@@ -118,7 +139,7 @@ FIR_fitSeconds   = 0.15;    % [s]  time window used for FIR LS fit
 FIR_lambda       = 1e-6;    % Tikhonov regularisation for FIR solve
 
 % --- Acoustic indices -----------------------------------------------------
-MinSecondsForFFT  = 10;       % minimum FFT length [s] (zero-padded if needed)
+MinSecondsForFFT  = 5;       % minimum FFT length [s] (zero-padded if needed)
 bandsPerOctave    = 3;
 freqLimsAI        = [20, fHigh];
 tEarly            = 0.080;    % [s]  C80 early/late boundary
@@ -132,8 +153,59 @@ verbose    = true;
 outRootDir = './polymaxRIR_results/';
 
 %% ========================== LOAD AND PREPARE ==============================
+%
+%   Discover all .wav files in INPUTFOLDER, create the output subfolder
+%   named after the input folder, then iterate over every file.  Each file
+%   is processed independently; errors are caught per-file so a single
+%   bad recording does not abort the whole batch.
 
-filenamewav = fullfile(inputPath, [filename, '.wav']);
+% --- Discover .wav files --------------------------------------------------
+wavList = dir(fullfile(inputFolder, '*.wav'));
+if isempty(wavList)
+    error('polymaxRIR:noWavFiles', ...
+        'No .wav files found in ''%s''.', inputFolder);
+end
+NFiles = numel(wavList);
+fprintf('\n=== polymaxRIR  BATCH MODE ===\n');
+fprintf('Input folder : %s\n', inputFolder);
+fprintf('Files found  : %d\n\n', NFiles);
+
+% --- Output subfolder named after the input folder ------------------------
+[~, folderName] = fileparts(strtrim(inputFolder));
+if isempty(folderName)   % handle trailing path separator
+    [~, folderName] = fileparts(fileparts(inputFolder));
+end
+outSubDir = fullfile(outRootDir, folderName);
+if ~exist(outSubDir, 'dir'), mkdir(outSubDir); end
+
+% --- Save the user-supplied fTransition so it can be reset each iteration -
+fTransition_user = fTransition;
+
+% --- Batch summary initialisation -----------------------------------------
+%   NOTE: do NOT use struct('field', cell(N,1), ...) here — that syntax
+%   creates an N-element struct array, not a scalar struct with array fields.
+%   Field-by-field assignment produces the correct scalar struct.
+batchSummary.filename       = cell(NFiles, 1);
+batchSummary.nRMSE_IIR      = nan(NFiles, 1);
+batchSummary.nRMSE_final    = nan(NFiles, 1);
+batchSummary.totalPoles     = nan(NFiles, 1);
+batchSummary.fTransition    = nan(NFiles, 1);
+batchSummary.T60global_mean = nan(NFiles, 1);
+batchSummary.isKept         = false(NFiles, 1);
+batchSummary.errorMsg       = cell(NFiles, 1);
+
+%% ========================= PER-FILE PROCESSING LOOP ======================
+
+for iFile = 1 : NFiles
+
+filename    = wavList(iFile).name(1 : end-4);   % strip .wav extension
+fTransition = fTransition_user;                  % reset for each file
+
+fprintf('\n--- File %d/%d : %s ---\n', iFile, NFiles, filename);
+
+try   % catch errors per-file so the batch continues on failure
+
+filenamewav = fullfile(inputFolder, wavList(iFile).name);
 [inputRaw, fs] = audioread(filenamewav);
 
 % Use first channel only; remove DC offset
@@ -146,8 +218,6 @@ if normaliseInput
     fprintf('Input normalised  (peak = %.4g)\n', pk);
 end
 
-fprintf('\n=== polymaxRIR ===\n');
-fprintf('File : %s\n', filenamewav);
 fprintf('fs   : %d Hz  |  N = %d samples (%.2f s)\n', ...
     fs, numel(inputRaw), numel(inputRaw)/fs);
 
@@ -162,12 +232,13 @@ fprintf('BR (ref) = %.4g  |  TR (ref) = %.4g\n', refAI.BR, refAI.TR);
 input = refAI.hAligned(:);
 
 % Build per-band damping look-up from T30 estimates (used later for T60cut
-% and HF peak-picking).  T60 ≈ 2 × T30 (assumes diffuse-field exponential decay).
+% and HF peak-picking).  T20 is an ISO 3382 estimate of T60 (decay time
+% fitted over -5 to -35 dB and extrapolated to 60 dB), so T60 = T30 here.
 fcBandsAI  = refAI.bandCentersHz(:);
-T30bandsAI = refAI.T30(:);
-idxV       = ~isnan(T30bandsAI) & (T30bandsAI > 0);
-T60v       = 2 * T30bandsAI(idxV);
-cBandsAI   = nan(size(T30bandsAI));
+T20bandsAI = refAI.T20(:);
+idxV       = ~isnan(T20bandsAI) & (T20bandsAI > 0);
+T60v       = T20bandsAI(idxV);   % T20 is already an estimate of T60
+cBandsAI   = nan(size(T20bandsAI));
 cBandsAI(idxV) = 3*log(10) ./ T60v;
 
 % Fallback damping coefficient for bands where T30 is unavailable
@@ -211,63 +282,55 @@ end
 
 %% ========================== BAND DEFINITION ===============================
 
+% --- Display bands (ISO octave / third-octave) ----------------------------
+%   Used for all statistics, console output, and figures.
 switch lower(bandMode)
     case 'thirdoctave'
-        [bandEdgesVec, bandCentresISO] = buildISOBands(fLow, fHigh, 3);
+        [dispEdgesVec, dispCentresISO] = buildISOBands(fLow, fHigh, 3);
     case 'fulloctave'
-        [bandEdgesVec, bandCentresISO] = buildISOBands(fLow, fHigh, 1);
+        [dispEdgesVec, dispCentresISO] = buildISOBands(fLow, fHigh, 1);
     case 'custom'
-        bandEdgesVec    = customBandEdges(:).';
-        bandEdgesVec    = bandEdgesVec(bandEdgesVec >= fLow & bandEdgesVec <= fHigh);
-        if numel(bandEdgesVec) < 2
+        dispEdgesVec   = customBandEdges(:).';
+        dispEdgesVec   = dispEdgesVec(dispEdgesVec >= fLow & dispEdgesVec <= fHigh);
+        if numel(dispEdgesVec) < 2
             error('polymaxRIR:customBands', ...
                 'customBandEdges must have >= 2 values within [fLow, fHigh].');
         end
-        % Geometric centres for custom bands
-        bandCentresISO = sqrt(bandEdgesVec(1:end-1) .* bandEdgesVec(2:end));
+        dispCentresISO = sqrt(dispEdgesVec(1:end-1) .* dispEdgesVec(2:end));
     otherwise
         error('polymaxRIR:unknownBandMode', 'Unknown bandMode ''%s''.', bandMode);
 end
 
-% Report any adjustment between user-specified fLow/fHigh and the actual
-% ISO band range (the ISO edges may extend slightly beyond the user values).
-if ~strcmp(lower(bandMode), 'custom')
-    if abs(bandEdgesVec(1) - fLow) > 0.5 || abs(bandEdgesVec(end) - fHigh) > 0.5
-        fprintf(['Note: ISO band edges adjusted analysis range  ' ...
-            '[%.2f – %.2f] Hz  ->  [%.2f – %.2f] Hz\n'], ...
-            fLow, fHigh, bandEdgesVec(1), bandEdgesVec(end));
-    end
+% Clip display bands to the usable FFT range (drop whole bands, not edges)
+dispEdgesVec = dispEdgesVec(:).';
+keepDisp     = (dispEdgesVec(2:end) > fv(2)) & (dispEdgesVec(1:end-1) < fv(end));
+if ~all(keepDisp)
+    dIdx         = find(keepDisp);
+    dispEdgesVec = [dispEdgesVec(dIdx), dispEdgesVec(dIdx(end) + 1)];
 end
+% Recompute centres from surviving edges (guards against any edge dropping)
+dispCentresISO = sqrt(dispEdgesVec(1:end-1) .* dispEdgesVec(2:end));
+NDispBands     = numel(dispEdgesVec) - 1;
 
-% Remove any bands that fall entirely outside the usable FFT range.
-% The FFT has valid data from fv(2) (first non-DC bin) to fv(end).
-% We drop whole bands, not clip edges, to preserve exact ISO widths.
-keepBand = (bandEdgesVec(2:end) > fv(2)) & (bandEdgesVec(1:end-1) < fv(end));
-if ~all(keepBand)
-    fprintf('  Dropping %d band(s) outside FFT range [%.2f – %.2f] Hz\n', ...
-        nnz(~keepBand), fv(2), fv(end));
-    % Rebuild edges from kept bands only
-    bandIdx      = find(keepBand);
-    bandEdgesVec = [bandEdgesVec(bandIdx), bandEdgesVec(bandIdx(end) + 1)];
-    bandCentresISO = bandCentresISO(keepBand);
+fprintf('Display bands : mode = %s  |  N = %d  |  [%.2f – %.2f] Hz\n', ...
+    bandMode, NDispBands, dispEdgesVec(1), dispEdgesVec(end));
+
+% --- Processing bands (linear, fixed width) --------------------------------
+%   PolyMax and peak-picking run on these narrow bands.  Their width is
+%   procBandWidth_Hz, independent of bandMode, so polynomial orders remain
+%   tractable even for wide display octave bands.
+procEdgesVec = buildLinearBands(fLow, fHigh, procBandWidth_Hz, fv);
+% Drop degenerate processing bands
+procEdgesVec = procEdgesVec(:).';
+validP       = find(diff(procEdgesVec) > 0.5*df);
+if numel(validP) < numel(procEdgesVec) - 1
+    procEdgesVec = [procEdgesVec(validP), procEdgesVec(validP(end) + 1)];
 end
+procCentres  = 0.5*(procEdgesVec(1:end-1) + procEdgesVec(2:end));
+NProcBands   = numel(procEdgesVec) - 1;
 
-% Final degenerate-band guard: drop any bands thinner than half an FFT bin.
-% After this, always recompute bandCentresISO from the surviving edges so
-% it can never be out of sync with bandEdgesVec regardless of what the
-% earlier filtering steps did.
-bandEdgesVec = bandEdgesVec(:).';
-valid        = find(diff(bandEdgesVec) > 0.5*df);
-if numel(valid) < numel(bandEdgesVec) - 1
-    bandEdgesVec = [bandEdgesVec(valid), bandEdgesVec(valid(end) + 1)];
-end
-% Always recompute centres from the final edges (geometric mean of each pair).
-bandCentresISO = sqrt(bandEdgesVec(1:end-1) .* bandEdgesVec(2:end));
-
-NBands = numel(bandEdgesVec) - 1;
-
-fprintf('Bands : mode = %s  |  N = %d  |  [%.2f – %.2f] Hz  (exact ISO edges)\n', ...
-    bandMode, NBands, bandEdgesVec(1), bandEdgesVec(end));
+fprintf('Processing bands : width = %.0f Hz  |  N = %d  |  [%.2f – %.2f] Hz\n', ...
+    procBandWidth_Hz, NProcBands, procEdgesVec(1), procEdgesVec(end));
 
 %% ===================== PRE-ALLOCATE STORAGE ==============================
 
@@ -276,9 +339,11 @@ fAll       = zeros(MAX_POLES, 1);
 cAll       = zeros(MAX_POLES, 1);
 aAll       = zeros(MAX_POLES, 1);
 bAll       = zeros(MAX_POLES, 1);
-bandIdxAll = zeros(MAX_POLES, 1, 'int32');
+bandIdxAll = zeros(MAX_POLES, 1, 'int32');   % indexes into procEdgesVec
 cumPoles   = 0;
 
+% Per-processing-band struct (used during the fitting loop and refinement).
+% Display-band statistics are computed separately after all poles are found.
 poleStats_template = struct( ...
     'flow', NaN, 'fhigh', NaN, 'fcBand', NaN, 'N', 0, ...
     'densityRatio', NaN, 'modalDensity_Hz', NaN, ...
@@ -286,27 +351,27 @@ poleStats_template = struct( ...
     'meanSpacing_Hz', NaN, 'stdSpacing_Hz', NaN, 'cvSpacing', NaN, ...
     'meanT60', NaN, 'stdT60', NaN, 'cvT60', NaN, ...
     'meanC', NaN, 'stdC', NaN, 'regime', 'LF');
-poleStats = repmat(poleStats_template, 1, NBands);
+procPoleStats = repmat(poleStats_template, 1, NProcBands);
 
-%% =================== INITIAL POLYMAX PASS (per band) =====================
+%% =================== INITIAL POLYMAX PASS (per processing band) ==========
 
-fprintf('\n=== INITIAL POLYMAX PASS ===\n');
+fprintf('\n=== INITIAL POLYMAX PASS (%d processing bands) ===\n', NProcBands);
 
-for ib = 1 : NBands
-    flow   = bandEdgesVec(ib);
-    fhigh  = bandEdgesVec(ib + 1);
-    fcBand = sqrt(flow * fhigh);
+for ib = 1 : NProcBands
+    flow   = procEdgesVec(ib);
+    fhigh  = procEdgesVec(ib + 1);
+    fcBand = procCentres(ib);
     bwBand = fhigh - flow;
-    T60est = interpT60band(fcBand, fcBandsAI, T30bandsAI, cFallback);
+    T60est = interpT60band(fcBand, fcBandsAI, T20bandsAI, cFallback);
 
     % Skip bands that are too narrow to support even a minimal fit
     minBW_Hz = max(3*df, 2.0);
     if bwBand < minBW_Hz
         if verbose
             fprintf('  Band %2d/%2d  [%6.1f – %6.1f Hz]  SKIPPED (BW = %.2f Hz)\n', ...
-                ib, NBands, flow, fhigh, bwBand);
+                ib, NProcBands, flow, fhigh, bwBand);
         end
-        poleStats(ib) = emptyBandStats(flow, fhigh, fcBand, 'LF');
+        procPoleStats(ib) = emptyBandStats(flow, fhigh, fcBand, 'LF');
         continue;
     end
 
@@ -328,7 +393,7 @@ for ib = 1 : NBands
             fprintf(['  Band %2d/%2d  [%6.1f – %6.1f Hz]  LF  |  ' ...
                 'fc = %.1f Hz  BW = %.1f Hz  bins = %d  |  ' ...
                 'NordMax = %d  step = %d  Nexp = %d  T60cut = %.1f s\n'], ...
-                ib, NBands, flow, fhigh, fcBand, bwBand, Nbins, ...
+                ib, NProcBands, flow, fhigh, fcBand, bwBand, Nbins, ...
                 pmNordMax, pmStep, pmNexpected, pmT60cut);
         end
         [fBand, cBand] = polymaxWrapper(fftBand, fvBand, ...
@@ -341,7 +406,7 @@ for ib = 1 : NBands
             fprintf(['  Band %2d/%2d  [%6.1f – %6.1f Hz]  HF  |  ' ...
                 'fc = %.1f Hz  BW = %.1f Hz  bins = %d  |  ' ...
                 'peak-pick  T60est = %.2f s\n'], ...
-                ib, NBands, flow, fhigh, fcBand, bwBand, Nbins, T60est);
+                ib, NProcBands, flow, fhigh, fcBand, bwBand, Nbins, T60est);
         end
         [fBand, cBand] = peakPickWrapper(fftBand, fvBand, df, ...
             minPeakProm_dB, minPeakDist_Hz, cFromT60);
@@ -349,7 +414,7 @@ for ib = 1 : NBands
 
     if isempty(fBand)
         if verbose, fprintf('    -> 0 poles\n'); end
-        poleStats(ib) = emptyBandStats(flow, fhigh, fcBand, regime);
+        procPoleStats(ib) = emptyBandStats(flow, fhigh, fcBand, regime);
         continue;
     end
 
@@ -384,7 +449,7 @@ for ib = 1 : NBands
     end
 
     if Np == 0
-        poleStats(ib) = emptyBandStats(flow, fhigh, fcBand, regime);
+        procPoleStats(ib) = emptyBandStats(flow, fhigh, fcBand, regime);
         continue;
     end
 
@@ -395,12 +460,12 @@ for ib = 1 : NBands
     bandIdxAll(cumPoles + 1 : cumPoles + Np) = ib;
     cumPoles = cumPoles + Np;
 
-    poleStats(ib) = computeBandStats(fBand, cBand, flow, fhigh, fcBand, regime);
-    poleStats(ib).stdT60 = T60std_raw;   % restore spread from original per-pole values
+    procPoleStats(ib) = computeBandStats(fBand, cBand, flow, fhigh, fcBand, regime);
+    procPoleStats(ib).stdT60 = T60std_raw;   % restore spread from original per-pole values
 
     if verbose
         fprintf('    -> %d poles  |  cMean = %.4g (T60 = %.3f s)  |  density = %.4f modes/Hz\n', ...
-            Np, cMean, 3*log(10)/cMean, poleStats(ib).modalDensity_Hz);
+            Np, cMean, 3*log(10)/cMean, procPoleStats(ib).modalDensity_Hz);
     end
 end
 
@@ -414,8 +479,13 @@ bandIdxAll = bandIdxAll(1:cumPoles);
 fprintf('\nInitial pass complete : %d total poles\n', cumPoles);
 
 %% ===================== ITERATIVE RESIDUAL REFINEMENT =====================
+%
+%   outRef is simply the onset-aligned, normalised input signal.
+%   There is no reason to round-trip through FFT/IFFT — that reintroduces
+%   wrap-around artefacts for long-T60 signals.  The input is already the
+%   ground truth we want to compare against.
 
-outRef       = real(ifft([0; spcTarget; conj(spcTarget(end:-1:1))]));
+outRef       = input(:);   % length = numel(input), no IFFT wrap-around
 prevNRMSE    = Inf;
 noImproveCnt = 0;
 
@@ -424,10 +494,24 @@ if useIterativeRefinement && nRefinementIters > 0
 
     for iIter = 1 : nRefinementIters
 
-        spcSyn_cur = spectrumBuild(aAll, bAll, cAll, fAll, omvFull);
-        outSyn_cur = real(ifft([0; spcSyn_cur; conj(spcSyn_cur(end:-1:1))]));
-        Lout       = min(numel(outRef), numel(outSyn_cur));
-        curNRMSE   = normalisedRMSE_time(outRef(1:Lout), outSyn_cur(1:Lout));
+        % Build synthetic spectrum band-by-band — used for the spectral residual only.
+        spcSyn_cur = zeros(size(spcTarget));
+        for ib = 1 : NProcBands
+            idxIB = (bandIdxAll(1:cumPoles) == ib);
+            if ~any(idxIB), continue; end
+            [~, ibs_s] = min(abs(fv - procEdgesVec(ib)));
+            [~, ibe_s] = min(abs(fv - procEdgesVec(ib + 1)));
+            ibe_s = max(ibe_s, ibs_s + 1);
+            omvSlice = 2*pi * fv(ibs_s:ibe_s);
+            spcSyn_cur(ibs_s:ibe_s) = spcSyn_cur(ibs_s:ibe_s) + ...
+                spectrumBuildSlice(aAll(idxIB), bAll(idxIB), ...
+                                   cAll(idxIB), fAll(idxIB), omvSlice);
+        end
+
+        % nRMSE via direct time-domain synthesis — no IFFT wrap-around.
+        outSyn_cur = synthesizeIR(aAll(1:cumPoles), bAll(1:cumPoles), ...
+                                   cAll(1:cumPoles), fAll(1:cumPoles), fs, numel(outRef));
+        curNRMSE   = normalisedRMSE_time(outRef, outSyn_cur);
         fprintf('\n  Iter %d/%d  |  nRMSE_time = %.6f\n', ...
             iIter, nRefinementIters, curNRMSE);
 
@@ -447,14 +531,14 @@ if useIterativeRefinement && nRefinementIters > 0
         spcResidual = spcTarget - spcSyn_cur;
         nAdded      = 0;
 
-        for ib = 1 : NBands
-            flow   = bandEdgesVec(ib);
-            fhigh  = bandEdgesVec(ib + 1);
-            fcBand = sqrt(flow * fhigh);
+        for ib = 1 : NProcBands
+            flow   = procEdgesVec(ib);
+            fhigh  = procEdgesVec(ib + 1);
+            fcBand = procCentres(ib);
             bwBand = fhigh - flow;
             if bwBand < max(3*df, 2.0), continue; end
 
-            T60est = interpT60band(fcBand, fcBandsAI, T30bandsAI, cFallback);
+            T60est = interpT60band(fcBand, fcBandsAI, T20bandsAI, cFallback);
 
             [~, ibs] = min(abs(fv - flow));
             [~, ibe] = min(abs(fv - fhigh));
@@ -518,26 +602,32 @@ if useIterativeRefinement && nRefinementIters > 0
         end
         fprintf('    Added %d new poles  (total : %d)\n', nAdded, cumPoles);
 
-        % Re-average damping per band after adding poles
-        for ib = 1 : NBands
-            idxIB = (bandIdxAll(1:cumPoles) == ib);
-            if any(idxIB), cAll(idxIB) = mean(cAll(idxIB)); end
+        % Pre-compute band membership once — reused by the damping re-average
+        % and the stats update, replacing two O(NProcBands × cumPoles) scans.
+        bandMembership = cell(NProcBands, 1);
+        for ib = 1 : NProcBands
+            bandMembership{ib} = find(bandIdxAll(1:cumPoles) == ib);
         end
 
-        % Global banded LS re-solve for amplitudes
+        % Re-average damping per processing band after adding poles
+        for ib = 1 : NProcBands
+            idx = bandMembership{ib};
+            if ~isempty(idx), cAll(idx) = mean(cAll(idx)); end
+        end
+
+        % Global banded LS re-solve for amplitudes (uses processing bands)
         [aAll(1:cumPoles), bAll(1:cumPoles)] = globalBandedLS( ...
             spcTarget, fv, fAll(1:cumPoles), cAll(1:cumPoles), ...
-            bandIdxAll(1:cumPoles), bandEdgesVec, overlapFrac);
+            bandIdxAll(1:cumPoles), procEdgesVec, overlapFrac);
 
-        % Update per-band statistics
-        for ib = 1 : NBands
-            idxIB = (bandIdxAll(1:cumPoles) == ib);
-            if any(idxIB)
-                poleStats(ib) = computeBandStats( ...
-                    fAll(idxIB), cAll(idxIB), ...
-                    bandEdgesVec(ib), bandEdgesVec(ib + 1), ...
-                    sqrt(bandEdgesVec(ib) * bandEdgesVec(ib + 1)), ...
-                    poleStats(ib).regime);
+        % Update per-processing-band statistics (regime info used in next iter)
+        for ib = 1 : NProcBands
+            idx = bandMembership{ib};
+            if ~isempty(idx)
+                procPoleStats(ib) = computeBandStats( ...
+                    fAll(idx), cAll(idx), ...
+                    procEdgesVec(ib), procEdgesVec(ib + 1), ...
+                    procCentres(ib), procPoleStats(ib).regime);
             end
         end
     end
@@ -554,12 +644,26 @@ cAll = cAll(iSort); aAll = aAll(iSort);
 bAll = bAll(iSort); bandIdxAll = bandIdxAll(iSort);
 
 %% ========================= FINAL IIR SPECTRUM ============================
+%
+%   spcSyn_IIR is built band-by-band for the spectrum plot and residual.
+%   The time-domain output uses direct modal synthesis — synthesizeIR —
+%   so decays are physically correct regardless of FFT window length.
 
-spcSyn_IIR = spectrumBuild(aAll, bAll, cAll, fAll, omvFull);
-outSyn_IIR = real(ifft([0; spcSyn_IIR; conj(spcSyn_IIR(end:-1:1))]));
-Lout       = min(numel(outRef), numel(outSyn_IIR));
-outRef     = outRef(1:Lout);
-outSyn_IIR = outSyn_IIR(1:Lout);
+spcSyn_IIR = zeros(size(spcTarget));
+for ib = 1 : NProcBands
+    idxIB = (bandIdxAll == ib);
+    if ~any(idxIB), continue; end
+    [~, ibs_f] = min(abs(fv - procEdgesVec(ib)));
+    [~, ibe_f] = min(abs(fv - procEdgesVec(ib + 1)));
+    ibe_f = max(ibe_f, ibs_f + 1);
+    omvSlice = 2*pi * fv(ibs_f:ibe_f);
+    spcSyn_IIR(ibs_f:ibe_f) = spcSyn_IIR(ibs_f:ibe_f) + ...
+        spectrumBuildSlice(aAll(idxIB), bAll(idxIB), ...
+                           cAll(idxIB), fAll(idxIB), omvSlice);
+end
+
+Lout       = numel(outRef);
+outSyn_IIR = synthesizeIR(aAll, bAll, cAll, fAll, fs, Lout);
 nRMSE_IIR  = normalisedRMSE_time(outRef, outSyn_IIR);
 
 fprintf('\nFinal IIR  |  poles = %d  |  nRMSE_time = %.6f\n', cumPoles, nRMSE_IIR);
@@ -586,10 +690,19 @@ end
 
 nRMSE_final = normalisedRMSE_time(outRef, outSyn);
 
-%% ========================== STATISTICS ===================================
+%% ======= REMAP POLES TO DISPLAY BANDS AND COMPUTE DISPLAY STATISTICS =====
+%
+%   Now that all poles are finalised, assign each pole to its ISO display
+%   band by frequency and compute per-display-band statistics.  These are
+%   what is shown in all console output, figures, and the saved MAT file.
 
-fprintf('\n=== PER-BAND POLE STATISTICS ===\n');
-globalStats = computeGlobalStats(poleStats, fAll, cAll, bandEdgesVec, V_room, c_sound);
+dispBandIdxAll = assignToDisplayBands(fAll, dispEdgesVec);
+
+poleStats = computeDisplayBandStats( ...
+    fAll, cAll, dispEdgesVec, dispCentresISO, dispBandIdxAll, fTransition);
+
+fprintf('\n=== PER-BAND POLE STATISTICS (display bands) ===\n');
+globalStats = computeGlobalStats(poleStats, fAll, cAll, dispEdgesVec, V_room, c_sound);
 printAllStats(globalStats, poleStats, verbose);
 
 %% ============================== PLOTS ====================================
@@ -597,20 +710,21 @@ printAllStats(globalStats, poleStats, verbose);
 tv = (0 : Lout - 1).' / fs;
 
 % --- Spectrum and time-domain comparison ----------------------------------
-figure('Name', 'polymaxRIR — Spectrum', 'Color', 'w', 'Position', [50 50 1100 700]);
+hFig_spectrum = figure('Name', 'polymaxRIR — Spectrum', ...
+    'Color', 'w', 'Position', [50 50 1100 700]);
 
 subplot(3, 1, 1);
 plot(fv, 20*log10(abs(spcTarget)  + eps), 'k', 'LineWidth', 0.7); hold on;
 plot(fv, 20*log10(abs(spcSyn_IIR) + eps), 'r', 'LineWidth', 0.7);
-for ib = 1 : NBands
-    xline(bandEdgesVec(ib), '--', 'Color', [0.75 0.75 0.75], ...
+for ib = 1 : NDispBands
+    xline(dispEdgesVec(ib), '--', 'Color', [0.75 0.75 0.75], ...
         'HandleVisibility', 'off', 'LineWidth', 0.5);
 end
 xline(fTransition, '-', 'Color', [0 0.5 0], 'LineWidth', 1.2, 'Label', 'f_{Sch}');
 xlim([fLow fHigh]);
 xlabel('f (Hz)'); ylabel('|H| (dB)');
 legend('Target', 'Synthetic', 'Location', 'best');
-title(sprintf('%s — %d poles (LF precise + HF clustered)', filename, cumPoles));
+title(sprintf('%s — %d poles', filename, cumPoles));
 
 subplot(3, 1, 2);
 plot(fv, 20*log10(abs(spcTarget - spcSyn_IIR) + eps), ...
@@ -628,55 +742,119 @@ xlim([0, min(500, tv(end)*1e3)]);
 title(sprintf('Time domain  (nRMSE = %.4g)', nRMSE_final));
 
 % --- Per-band statistics --------------------------------------------------
-figure('Name', 'polymaxRIR — Per-band statistics', ...
+hFig_bandStats = figure('Name', 'polymaxRIR — Per-band statistics', ...
     'Color', 'w', 'Position', [50 800 1200 600]);
-plotBandStats(poleStats, globalStats, NBands, fTransition);
+plotBandStats(poleStats, globalStats, NDispBands, fTransition);
 
 % --- LF T60 comparison: PolyMax poles vs acoustic_indices -----------------
-figure('Name', 'polymaxRIR — LF T60 comparison', ...
+hFig_LFcomp = figure('Name', 'polymaxRIR — LF T60 comparison', ...
     'Color', 'w', 'Position', [1300 800 800 500]);
-plotLFComparison(poleStats, refAI, bandEdgesVec, bandCentresISO, fTransition);
+plotLFComparison(poleStats, refAI, dispEdgesVec, dispCentresISO, fTransition);
 
 %% ============================== SAVE =====================================
 
-if ~exist(outRootDir, 'dir'), mkdir(outRootDir); end
+if ~exist(outSubDir, 'dir'), mkdir(outSubDir); end
 
-saveS.fAll        = fAll;
-saveS.cAll        = cAll;
-saveS.aAll        = aAll;
-saveS.bAll        = bAll;
-saveS.bandIdxAll  = bandIdxAll;
-saveS.hFIR        = hFIR;
-saveS.poleStats   = poleStats;
-saveS.globalStats = globalStats;
-saveS.refAI       = refAI;
-saveS.nRMSE_IIR   = nRMSE_IIR;
-saveS.nRMSE_final = nRMSE_final;
-saveS.bandEdgesVec = bandEdgesVec;
-saveS.fTransition  = fTransition;
-saveS.fs          = fs;
-saveS.filename    = filename;
-saveS.bandMode    = bandMode;
-saveS.V_room      = V_room;
+saveS.fAll             = fAll;
+saveS.cAll             = cAll;
+saveS.aAll             = aAll;
+saveS.bAll             = bAll;
+saveS.bandIdxAll       = bandIdxAll;       % indexes into procEdgesVec
+saveS.dispBandIdxAll   = dispBandIdxAll;   % indexes into dispEdgesVec
+saveS.hFIR             = hFIR;
+saveS.poleStats        = poleStats;        % per display band
+saveS.globalStats      = globalStats;
+saveS.refAI            = refAI;
+saveS.nRMSE_IIR        = nRMSE_IIR;
+saveS.nRMSE_final      = nRMSE_final;
+saveS.dispEdgesVec     = dispEdgesVec;
+saveS.procEdgesVec     = procEdgesVec;
+saveS.fTransition      = fTransition;
+saveS.fs               = fs;
+saveS.filename         = filename;
+saveS.bandMode         = bandMode;
+saveS.procBandWidth_Hz = procBandWidth_Hz;
+saveS.V_room           = V_room;
 
-savePath = fullfile(outRootDir, [filename, '_polymaxRIR.mat']);
+savePath = fullfile(outSubDir, [filename, '_polymaxRIR.mat']);
 save(savePath, '-struct', 'saveS');
-fprintf('MAT saved : %s\n', savePath);
+fprintf('MAT saved   : %s\n', savePath);
 
 outSynNorm = outSyn / (max(abs(outSyn)) + eps);
-audiowrite(fullfile(outRootDir, [filename, '_polymaxRIR_SYNTH.wav']), outSynNorm, fs);
+audiowrite(fullfile(outSubDir, [filename, '_polymaxRIR_SYNTH.wav']), outSynNorm, fs);
+
+% --- Save figures as .fig files -------------------------------------------
+savefig(hFig_spectrum,  fullfile(outSubDir, [filename, '_spectrum.fig']));
+savefig(hFig_bandStats, fullfile(outSubDir, [filename, '_bandStats.fig']));
+savefig(hFig_LFcomp,    fullfile(outSubDir, [filename, '_LFcomparison.fig']));
+fprintf('FIG saved   : %s_{spectrum,bandStats,LFcomparison}.fig\n', ...
+    fullfile(outSubDir, filename));
 
 isKept = nRMSE_final <= nRMSE_time_keep_threshold;
 fprintf('\nnRMSE_final = %.4g  |  threshold = %.4g  ->  %s\n', ...
     nRMSE_final, nRMSE_time_keep_threshold, ...
     conditional(isKept, 'KEPT', 'DISCARDED'));
 
+% --- Record in batch summary ----------------------------------------------
+batchSummary.filename{iFile}        = filename;
+batchSummary.nRMSE_IIR(iFile)       = nRMSE_IIR;
+batchSummary.nRMSE_final(iFile)     = nRMSE_final;
+batchSummary.totalPoles(iFile)      = cumPoles;
+batchSummary.fTransition(iFile)     = fTransition;
+batchSummary.T60global_mean(iFile)  = globalStats.T60global_mean;
+batchSummary.isKept(iFile)          = isKept;
+batchSummary.errorMsg{iFile}        = '';
+
+catch ME
+    % Per-file error: log and continue with the next file
+    fprintf('\n  ERROR on file ''%s'' : %s\n  Skipping.\n', filename, ME.message);
+    batchSummary.filename{iFile} = filename;
+    batchSummary.errorMsg{iFile} = ME.message;
+end   % try
+
+close all;   % close figures before next file to avoid accumulation
+
+end   % for iFile
+
+%% ========================= BATCH SUMMARY =================================
+
+fprintf('\n\n=== BATCH COMPLETE : %d/%d files processed ===\n', ...
+    nnz(~cellfun(@isempty, batchSummary.filename)), NFiles);
+fprintf('\n%-40s  %8s  %8s  %7s  %6s  %s\n', ...
+    'Filename', 'nRMSE_IIR', 'nRMSE_fin', 'Poles', 'T60(s)', 'Status');
+fprintf('%s\n', repmat('-', 1, 85));
+for iFile = 1 : NFiles
+    if isempty(batchSummary.errorMsg{iFile})
+        status = conditional(batchSummary.isKept(iFile), 'KEPT', 'DISCARDED');
+        fprintf('%-40s  %8.4g  %8.4g  %7d  %6.2f  %s\n', ...
+            batchSummary.filename{iFile}, ...
+            batchSummary.nRMSE_IIR(iFile), ...
+            batchSummary.nRMSE_final(iFile), ...
+            batchSummary.totalPoles(iFile), ...
+            batchSummary.T60global_mean(iFile), ...
+            status);
+    else
+        fprintf('%-40s  %s\n', batchSummary.filename{iFile}, ...
+            ['ERROR: ', batchSummary.errorMsg{iFile}]);
+    end
+end
+
+% Save batch summary alongside the individual results
+batchSummary.inputFolder   = inputFolder;
+batchSummary.outSubDir     = outSubDir;
+batchSummary.processedDate = datestr(now);  %#ok<TNOW1,DATST>
+batchSavePath = fullfile(outSubDir, 'batchSummary.mat');
+save(batchSavePath, 'batchSummary');
+fprintf('\nBatch summary saved : %s\n', batchSavePath);
+
 
 %% ########################################################################
 %%  LOCAL FUNCTIONS
 %%
 %%  Section order:
-%%    1.  Band utilities        (buildISOBands, selectRegime)
+%%    1.  Band utilities        (buildISOBands, buildLinearBands,
+%%                               selectRegime, assignToDisplayBands,
+%%                               computeDisplayBandStats)
 %%    2.  Parameter selection   (autoPolymaxParams, interpT60band)
 %%    3.  Pole estimation       (polymaxWrapper, peakPickWrapper)
 %%    4.  Amplitude solve       (leastSqWeights, rejectGainOutliers,
@@ -783,8 +961,84 @@ else
 end
 end
 
-% =========================================================================
-%  2. Parameter selection
+% -------------------------------------------------------------------------
+
+function edges = buildLinearBands(fLow, fHigh, bwHz, fv)
+%BUILDLINEARBANDS  Narrow linear processing bands of fixed width BWHZ.
+%
+%   Produces edges [fLow, fLow+bwHz, fLow+2*bwHz, ...] clipped so that
+%   the last edge does not exceed fHigh and all edges remain within the
+%   usable FFT range [fv(2), fv(end)].  A partial band at the top is
+%   always included so that no part of [fLow, fHigh] is left uncovered.
+
+edges = fLow : bwHz : fHigh;
+if edges(end) < fHigh
+    edges(end+1) = fHigh;   % add partial band at top if needed
+end
+% Clip to FFT range
+edges(1)   = max(edges(1),   fv(2));
+edges(end) = min(edges(end), fv(end));
+edges      = unique(edges);
+end
+
+% -------------------------------------------------------------------------
+
+function dispIdx = assignToDisplayBands(fAll, dispEdgesVec)
+%ASSIGNTODISPLAYBANDS  Map each pole to its ISO display band by frequency.
+%
+%   Returns DISPIDX (same length as FALL) where DISPIDX(p) = k means
+%   pole p falls in display band k, i.e. dispEdgesVec(k) <= fAll(p) < dispEdgesVec(k+1).
+%   Poles outside the display range receive index 0.
+
+NDisp  = numel(dispEdgesVec) - 1;
+dispIdx = zeros(numel(fAll), 1, 'int32');
+for k = 1 : NDisp
+    mask = (fAll >= dispEdgesVec(k)) & (fAll < dispEdgesVec(k+1));
+    dispIdx(mask) = k;
+end
+% Include any poles sitting exactly on the last edge
+dispIdx(fAll == dispEdgesVec(end) & dispIdx == 0) = NDisp;
+end
+
+% -------------------------------------------------------------------------
+
+function poleStats = computeDisplayBandStats(fAll, cAll, dispEdgesVec, ...
+    dispCentresISO, dispBandIdxAll, fTransition)
+%COMPUTEDISPLAYBANDSTATS  Build per-display-band statistics from all poles.
+%
+%   Groups poles by their display band index, computes statistics for each
+%   band, and sets regime ('LF'/'HF') based on whether the band centre is
+%   below or above fTransition.  Preserves the per-pole T60 spread (stdT60)
+%   correctly since cAll at this point still contains the pre-homogenisation
+%   values stored per processing band (all poles in a processing band share
+%   the same c, but processing bands are narrower than display bands so the
+%   spread across processing bands within one display band is meaningful).
+
+NDisp = numel(dispEdgesVec) - 1;
+
+poleStats_template = struct( ...
+    'flow', NaN, 'fhigh', NaN, 'fcBand', NaN, 'N', 0, ...
+    'densityRatio', NaN, 'modalDensity_Hz', NaN, ...
+    'meanF', NaN, 'stdF', NaN, ...
+    'meanSpacing_Hz', NaN, 'stdSpacing_Hz', NaN, 'cvSpacing', NaN, ...
+    'meanT60', NaN, 'stdT60', NaN, 'cvT60', NaN, ...
+    'meanC', NaN, 'stdC', NaN, 'regime', 'LF');
+poleStats = repmat(poleStats_template, 1, NDisp);
+
+for k = 1 : NDisp
+    fc     = dispCentresISO(k);
+    regime = selectRegime(fc, fTransition);
+    idx    = (dispBandIdxAll == k);
+
+    if ~any(idx)
+        poleStats(k) = emptyBandStats(dispEdgesVec(k), dispEdgesVec(k+1), fc, regime);
+        continue;
+    end
+
+    poleStats(k) = computeBandStats( ...
+        fAll(idx), cAll(idx), dispEdgesVec(k), dispEdgesVec(k+1), fc, regime);
+end
+end
 % =========================================================================
 
 function [NordMin, NordMax, ordStep, T60cut, Nexpected] = ...
@@ -833,14 +1087,14 @@ end
 
 % -------------------------------------------------------------------------
 
-function T60est = interpT60band(fcBand, fcBandsAI, T30bandsAI, cFallback)
+function T60est = interpT60band(fcBand, fcBandsAI, T20bandsAI, cFallback)
 %INTERPT60BAND  Interpolate T60 estimate at an arbitrary band centre.
 %
 %   Interpolates log-linearly through the per-band T30 values from
 %   acoustic_indices, extrapolating at the edges.  Falls back to
 %   3*ln(10)/cFallback if fewer than two valid T30 values are available.
 
-T60all = 2 * T30bandsAI(:);     % T60 ≈ 2 × T30 for exponential decay
+T60all = T20bandsAI(:);     % T20 is an ISO estimate of T60; no factor of 2
 idxV   = ~isnan(T60all) & (T60all > 0);
 
 if nnz(idxV) >= 2
@@ -988,15 +1242,15 @@ fBand = fBand(:).';
 cBand = cBand(:).';
 
 rad   = max((2*pi*fBand).^2 - cBand.^2, 1e-12);
-poles = -cBand + 1j*sqrt(rad);
+poles = -cBand + 1j*sqrt(rad);       % 1×Npoles
 
-% Build basis matrices for real (Ra) and imaginary (Rb) residue parts
-Ra = zeros(Lfv, Npoles);
-Rb = zeros(Lfv, Npoles);
-for m = 1 : Npoles
-    Ra(:, m) = 1./(1j*omvBand - poles(m)) + 1./(1j*omvBand - conj(poles(m)));
-    Rb(:, m) = 1j./(1j*omvBand - poles(m)) - 1j./(1j*omvBand - conj(poles(m)));
-end
+% Build basis matrices Ra, Rb via broadcasting (Lfv×Npoles each).
+% jomv is Lfv×1, poles is 1×Npoles → D is Lfv×Npoles without a loop.
+jomv = 1j * omvBand(:);              % Lfv×1
+D    = jomv - poles;                 % Lfv×Npoles:  jω - λ_p
+Dc   = jomv - conj(poles);          % Lfv×Npoles:  jω - λ_p*
+Ra   = 1./D  + 1./Dc;               % Lfv×Npoles
+Rb   = 1j./D - 1j./Dc;             % Lfv×Npoles
 
 R   = [Ra, Rb];
 RtR = R' * R;
@@ -1113,26 +1367,96 @@ end
 %  5. Spectrum / error
 % =========================================================================
 
+function h = synthesizeIR(aVec, bVec, cVec, fVec, fs, Nout)
+%SYNTHESIZEIR  Direct time-domain modal synthesis — no IFFT, no wrap-around.
+%
+%   h(n) = 2·Re[ Σ_p r_p · exp(λ_p · n/fs) ]
+%   r_p  = a_p + j·b_p
+%   λ_p  = -c_p + j·√( (2π f_p)² - c_p² )
+%
+%   An IFFT-based reconstruction treats the spectrum as periodic with
+%   period T = N/fs.  Any pole whose T60 exceeds T has its tail wrapped
+%   back onto the end of the block, producing a spurious burst.
+%   This function evaluates the modal sum directly at each time sample
+%   so every mode decays correctly to zero with no periodicity assumption.
+%   Poles are processed in chunks to keep memory usage bounded.
+
+aVec = aVec(:);  bVec = bVec(:);  cVec = cVec(:);  fVec = fVec(:);
+Np     = numel(aVec);
+rad    = max((2*pi*fVec).^2 - cVec.^2, 1e-12);
+lambda = -cVec + 1j*sqrt(rad);   % complex pole positions [rad/s]
+resids = aVec + 1j*bVec;
+
+n = (0 : Nout-1);   % 1×Nout time-sample index
+
+% Chunk size: keep each partial matrix ≤ ~50 MB (complex128 = 16 bytes)
+chunkSize = max(1, floor(50e6 / (Nout * 16)));
+
+h = zeros(Nout, 1);
+for p = 1 : chunkSize : Np
+    idx = p : min(p + chunkSize - 1, Np);
+    h = h + 2 * real(sum(resids(idx) .* exp(lambda(idx) .* n / fs), 1)).';
+end
+end
+
+% -------------------------------------------------------------------------
+
+function spc = spectrumBuildSlice(aVec, bVec, cVec, fVec, omv)
+%SPECTRUMBUILDSLICE  Modal spectrum for one narrow band (small Np, no chunking).
+%
+%   Identical algebra to spectrumBuild but operates on a short omv slice
+%   with only the Np poles belonging to one processing band, so the
+%   Np×Nbins_slice matrix is always small and memory-safe.  Used inside
+%   the iterative refinement loop to accumulate spcSyn_cur band-by-band.
+
+aVec = aVec(:);  bVec = bVec(:);  cVec = cVec(:);  fVec = fVec(:);
+omv  = omv(:).';
+rad    = max((2*pi*fVec).^2 - cVec.^2, 1e-12);
+poles  = -cVec + 1j*sqrt(rad);
+resids = aVec  + 1j*bVec;
+D   = 1j*omv - poles;
+Dc  = 1j*omv - conj(poles);
+spc = sum(resids./D + conj(resids)./Dc, 1);
+spc = spc(:);
+end
+
+% -------------------------------------------------------------------------
+
 function spc = spectrumBuild(aVec, bVec, cVec, fVec, omv)
 %SPECTRUMBUILD  Evaluate the modal partial-fraction spectrum at OMV.
 %
 %   Reconstructs H(jω) = Σ [ r_p/(jω−λ_p) + r_p*/(jω−λ_p*) ] at each
 %   frequency in OMV, where λ_p = −c_p + j·√(ωp²−cp²) and r_p = a_p + j·b_p.
+%
+%   Implementation: poles are processed in chunks so that each broadcast
+%   (Nchunk×Nfft) matrix fits comfortably in memory.  This is far faster than
+%   a per-pole loop but avoids allocating a full Npoles×Nfft matrix which
+%   would exhaust RAM for large pole counts.
 
 aVec = aVec(:);
 bVec = bVec(:);
 cVec = cVec(:);
 fVec = fVec(:);
-omv  = omv(:).';
+omv  = omv(:).';           % 1×Nfft
 
+Np     = numel(aVec);
+Nfft   = numel(omv);
 rad    = max((2*pi*fVec).^2 - cVec.^2, 1e-12);
-poles  = -cVec + 1j*sqrt(rad);
-resids = aVec + 1j*bVec;
+poles  = -cVec + 1j*sqrt(rad);   % Np×1
+resids = aVec + 1j*bVec;         % Np×1
 
-spc = zeros(1, numel(omv));
-for p = 1 : numel(aVec)
-    spc = spc + resids(p)./(1j*omv - poles(p)) ...
-              + conj(resids(p))./(1j*omv - conj(poles(p)));
+% Chunk size: target ~50 MB per chunk (complex double = 16 bytes)
+chunkSize = max(1, floor(50e6 / (Nfft * 16)));
+
+spc = zeros(1, Nfft);
+for p = 1 : chunkSize : Np
+    idx = p : min(p + chunkSize - 1, Np);
+    r  = resids(idx);      % chunk×1
+    pl = poles(idx);       % chunk×1
+    % Broadcast: (chunk×1) ./ (1×Nfft - chunk×1) → chunk×Nfft
+    D  = 1j*omv - pl;      % chunk×Nfft
+    Dc = 1j*omv - conj(pl);
+    spc = spc + sum(r./D + conj(r)./Dc, 1);
 end
 spc = spc(:);
 end
@@ -1319,16 +1643,16 @@ fprintf('  Modes <= f_Sch (theory)  : %d\n',      gStats.Ntheoretical_Sch);
 
 if ~verbose, return; end
 
-fprintf('\n%4s %3s %8s %8s %5s %9s %9s %8s %8s %8s %8s\n', ...
+fprintf('\n%4s %3s %8s %8s %5s %9s %9s %8s %8s %8s\n', ...
     'Band', 'Reg', 'flow', 'fhigh', 'N', 'dens_Hz', 'theo_Hz', ...
-    'ratio', 'mT60', 'cvT60', 'mSpc');
+    'mT60', 'cvT60', 'mSpc');
 
 for ib = 1 : numel(poleStats)
     s  = poleStats(ib);
     th = gStats.densTheo(ib);
-    fprintf('%4d %3s %8.1f %8.1f %5d %9.4f %9.4f %8.3f %8.3f %8.3f %8.3f\n', ...
+    fprintf('%4d %3s %8.1f %8.1f %5d %9.4f %9.4f %8.3f %8.3f %8.3f\n', ...
         ib, s.regime, s.flow, s.fhigh, s.N, s.modalDensity_Hz, th, ...
-        s.densityRatio, s.meanT60, s.cvT60, s.meanSpacing_Hz);
+        s.meanT60, s.cvT60, s.meanSpacing_Hz);
 end
 end
 
@@ -1394,10 +1718,10 @@ function plotLFComparison(poleStats, refAI, bandEdgesVec, bandCentresISO, fTrans
 %                      Error bars span [mean − std, mean + std].
 %                      Plotted as filled circles with vertical error bars.
 %
-%     • Acoustic-indices T60 = 2 × T30  — the Schroeder-integration T30
-%                      (or T20 fallback) from acoustic_indices, doubled to
-%                      estimate T60.  This is a single deterministic value
-%                      per band (no distribution), plotted as squares.
+%     • Acoustic-indices T30  — the reverberation time estimated from the
+%                      Schroeder integral by ISO 3382 (T30 fitted over -5 to
+%                      -35 dB, extrapolated to 60 dB).  T30 is itself an
+%                      estimate of T60 and is plotted directly as such.
 %
 %   The two traces use the same ISO centre frequencies, making direct
 %   comparison straightforward.  Bands with no PolyMax poles (N = 0) or
@@ -1449,14 +1773,14 @@ end
 % centre to each LF analysis band centre using log-frequency distance.
 
 ai_fc  = refAI.bandCentersHz(:);
-ai_T30 = refAI.T30(:);
+ai_T20 = refAI.T20(:);
 
 ai_T60atLF = nan(NLF, 1);
 
 for k = 1 : NLF
     [~, idx] = min(abs(log2(ai_fc / max(fc_lf(k), eps))));
-    if ~isempty(idx) && ~isnan(ai_T30(idx)) && ai_T30(idx) > 0
-        ai_T60atLF(k) = 2 * ai_T30(idx);   % T60 ≈ 2 × T30
+    if ~isempty(idx) && ~isnan(ai_T20(idx)) && ai_T20(idx) > 0
+        ai_T60atLF(k) = ai_T20(idx);   % T20 is an ISO 3382 estimate of T60
     end
 end
 
@@ -1490,7 +1814,7 @@ if any(hasNoPM)
         'DisplayName', 'PolyMax  (no poles)');
 end
 
-% Acoustic-indices T60 = 2 × T30
+% Acoustic-indices T30 (= T60 estimate per ISO 3382)
 hasAI = ~isnan(ai_T60atLF);
 if any(hasAI)
     plot(xPos(hasAI), ai_T60atLF(hasAI), ...
@@ -1500,7 +1824,7 @@ if any(hasAI)
         'MarkerSize',      8, ...
         'LineStyle',       '--', ...
         'LineWidth',       1.1, ...
-        'DisplayName',     'Acoustic indices  2 \times T_{30}');
+        'DisplayName',     'Acoustic indices  T_{30}  (ISO 3382)');
 
     % Connect with dashed line for readability
     plot(xPos(hasAI), ai_T60atLF(hasAI), '--', ...
@@ -1526,7 +1850,7 @@ xlabel('ISO band centre frequency (Hz)');
 ylabel('T_{60} (s)');
 legend('show', 'Location', 'best');
 grid on;
-title(sprintf(['LF bands (f_c < %.0f Hz) — PolyMax T_{60} vs acoustic-indices 2\\timesT_{30}\n' ...
+title(sprintf(['LF bands (f_c < %.0f Hz) — PolyMax T_{60} vs acoustic-indices T_{30}  (ISO 3382)\n' ...
     '(numbers above error bars = pole count per band)'], fTransition));
 end
 

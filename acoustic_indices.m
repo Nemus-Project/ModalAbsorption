@@ -13,12 +13,18 @@ function results = acoustic_indices(h, fs, bandsPerOctave, freqLims, tEarly, ali
 %        sample whose magnitude exceeds ALIGNTHRESHOLD_DB below the global
 %        peak.  A small pre-offset (5 samples) is applied to capture the
 %        leading edge of the direct sound.
-%     2. Band-wise decay time from Schroeder back-integration:
-%          • T30 (fit over -5 to -35 dB) when dynamic range >= 35 dB.
-%          • T20 (fit over -5 to -25 dB) as fallback when range >= 25 dB.
+%     2. Mid-frequency T60 crop: a quick T20 Schroeder estimate is made
+%        from a single 500–1000 Hz bandpass of the aligned RIR.  The signal
+%        is then hard-trimmed to that T60 length before further processing.
+%        Samples beyond one T60 carry negligible energy and only inflate
+%        computation.  If the estimate fails the full signal is kept.
+%     3. Band-wise reverberation time from Schroeder back-integration.
+%        Per ISO 3382, T20 is an estimate of T60 (the 60 dB decay time),
+%        obtained by fitting the Schroeder decay curve over the -5 to -25 dB
+%        range and extrapolating to 60 dB:
+%          • T20 (fit over -5 to -25 dB, extrapolated to 60 dB) when range >= 25 dB.
 %          • NaN otherwise.
-%        All values are stored in RESULTS.T30 regardless of which estimator
-%        was used; the adaptive choice is transparent to the caller.
+%        All values are stored in RESULTS.T20.
 %     3. Band-wise clarity C80 = 10·log10(E_early / E_late), where the
 %        early/late boundary is TEARLY seconds (typically 0.08 s).
 %     4. Wideband centre time Ts computed from the aligned, full-band RIR.
@@ -37,7 +43,7 @@ function results = acoustic_indices(h, fs, bandsPerOctave, freqLims, tEarly, ali
 %   OUTPUTS
 %     results : struct with fields
 %       .bandCentersHz  — analysis band centre frequencies [Hz]
-%       .T30            — decay time per band [s] (T30 or T20 adaptively)
+%       .T20            — decay time per band [s] (T20 estimator, ISO 3382)
 %       .C80            — clarity per band [dB]
 %       .Ts             — wideband centre time [s]
 %       .BR             — bass ratio (NaN if required bands not present)
@@ -81,7 +87,50 @@ N = numel(hAligned);
 t = (0 : N-1).' / fs;
 
 % =========================================================================
-%  2. Analysis band definitions
+%  2. Crop to mid-frequency T60 length
+% =========================================================================
+%
+%   Samples beyond one T60 carry negligible energy and only increase
+%   processing time.  The mid-frequency T60 is estimated from a quick
+%   T20 Schroeder integration over a representative mid-frequency
+%   range (500–1000 Hz).  The signal is then hard-trimmed to that
+%   length before the full band-wise analysis runs.
+
+MID_LO = 500;   % [Hz]  lower edge of mid-frequency range
+MID_HI = 1000;  % [Hz]  upper edge of mid-frequency range
+
+T60mid_crop = NaN;
+if MID_HI < fs/2
+    try
+        bpMid = designfilt('bandpassiir', ...
+            'FilterOrder',         8, ...
+            'HalfPowerFrequency1', MID_LO, ...
+            'HalfPowerFrequency2', MID_HI, ...
+            'SampleRate',          fs);
+        hMid      = filtfilt(bpMid, hAligned);
+        T60mid_crop = estimateDecayTime(hMid.^2, fs);
+    catch
+        % If the quick estimate fails, skip cropping and proceed in full.
+    end
+end
+
+if ~isnan(T60mid_crop) && T60mid_crop > 0
+    NcropMax = round(T60mid_crop * fs);
+    if NcropMax < numel(hAligned)
+        fprintf('acoustic_indices: cropping IR %d -> %d samples  (T60_mid = %.3f s)\n', ...
+            numel(hAligned), NcropMax, T60mid_crop);
+        hAligned = hAligned(1:NcropMax);
+    end
+else
+    fprintf('acoustic_indices: mid-T60 estimate unavailable — no cropping applied\n');
+end
+
+% Recompute N and t after potential crop
+N = numel(hAligned);
+t = (0 : N-1).' / fs;
+
+% =========================================================================
+%  3. Analysis band definitions
 % =========================================================================
 
 %   Centre frequencies follow the exact ISO 266 / IEC 61260 progression:
@@ -97,11 +146,11 @@ fc_all   = fRef * 2.^(n_all / bandsPerOctave);
 fc       = fc_all(fc_all >= fMin & fc_all <= fMax);   % centre-based selection
 nBands   = numel(fc);
 
-T30 = nan(nBands, 1);
+T20 = nan(nBands, 1);
 C80 = nan(nBands, 1);
 
 % =========================================================================
-%  3. Wideband centre time Ts
+%  4. Wideband centre time Ts
 % =========================================================================
 
 eWide = hAligned.^2;
@@ -112,7 +161,7 @@ else
 end
 
 % =========================================================================
-%  4. Band-wise decay time and clarity
+%  5. Band-wise decay time and clarity
 % =========================================================================
 
 for i = 1 : nBands
@@ -136,26 +185,26 @@ for i = 1 : nBands
     hBand = filtfilt(bpFilt, hAligned);
     eBand = hBand.^2;
 
-    % Adaptive T30/T20 from Schroeder integration
-    T30(i) = estimateDecayTime(eBand, fs);
+    % T20 from Schroeder integration
+    T20(i) = estimateDecayTime(eBand, fs);
 
     % Clarity: early-to-late energy ratio with boundary at tEarly
     C80(i) = computeClarity(eBand, fs, tEarly);
 end
 
 % =========================================================================
-%  5. Timbre ratios  (BR, TR)
+%  6. Timbre ratios  (BR, TR)
 % =========================================================================
 %
 %   BR = (T125 + T250)  / (T500 + T1000)
 %   TR = (T2000 + T4000) / (T500 + T1000)
 
-T125  = getBandValue(fc, T30, 125,  bandsPerOctave);
-T250  = getBandValue(fc, T30, 250,  bandsPerOctave);
-T500  = getBandValue(fc, T30, 500,  bandsPerOctave);
-T1000 = getBandValue(fc, T30, 1000, bandsPerOctave);
-T2000 = getBandValue(fc, T30, 2000, bandsPerOctave);
-T4000 = getBandValue(fc, T30, 4000, bandsPerOctave);
+T125  = getBandValue(fc, T20, 125,  bandsPerOctave);
+T250  = getBandValue(fc, T20, 250,  bandsPerOctave);
+T500  = getBandValue(fc, T20, 500,  bandsPerOctave);
+T1000 = getBandValue(fc, T20, 1000, bandsPerOctave);
+T2000 = getBandValue(fc, T20, 2000, bandsPerOctave);
+T4000 = getBandValue(fc, T20, 4000, bandsPerOctave);
 
 denom = T500 + T1000;
 
@@ -176,7 +225,7 @@ end
 % =========================================================================
 
 results.bandCentersHz = fc(:);
-results.T30           = T30;
+results.T20           = T20;
 results.C80           = C80;
 results.Ts            = Ts;
 results.BR            = BR;
@@ -203,11 +252,11 @@ legend('show', 'Location', 'best');
 figure('Name', 'acoustic_indices — decay and clarity', 'Color', 'w');
 
 subplot(2, 1, 1);
-semilogx(fc, T30, '-o', 'LineWidth', 1.2, 'MarkerSize', 5);
+semilogx(fc, T20, '-o', 'LineWidth', 1.2, 'MarkerSize', 5);
 grid on;
 xlabel('Frequency (Hz)');
 ylabel('Decay time (s)');
-title('Per-band decay time (T30 preferred, T20 fallback)');
+title('Reverberation time T_{20} per band  (ISO 3382 estimate of T_{60})');
 
 subplot(2, 1, 2);
 semilogx(fc, C80, '-o', 'LineWidth', 1.2, 'MarkerSize', 5);
@@ -258,16 +307,12 @@ end
 % =========================================================================
 
 function T = estimateDecayTime(e, fs)
-%ESTIMATEDECAYTIME  Adaptive T30/T20 from Schroeder back-integration.
+%ESTIMATEDECAYTIME  T20 from Schroeder back-integration.
 %
 %   Integrates the squared band-filtered impulse response backward in time
-%   (Schroeder integral), normalises to 0 dB, then estimates the noise floor
-%   from the last 30 % of the record to determine usable dynamic range.
-%
-%   Decision logic:
-%     dynRange >= 35 dB  ->  T30  (fit -5 to -35 dB, extrapolated x2)
-%     dynRange >= 25 dB  ->  T20  (fit -5 to -25 dB, extrapolated x3)
-%     otherwise          ->  NaN
+%   (Schroeder integral), normalises to 0 dB, then fits the decay curve
+%   over the -5 to -25 dB range and extrapolates to 60 dB (T20 method,
+%   ISO 3382).  Returns NaN when the usable dynamic range is below 25 dB.
 
 e = e(:);
 N = numel(e);
@@ -288,17 +333,13 @@ end
 EdB = 10*log10(E / mx + eps);   % peak ≈ 0 dB
 
 % Estimate noise floor from the last 30 % of the record
-tailIdx      = max(1, N - floor(0.3*N) + 1) : N;
-noiseFloor   = median(EdB(tailIdx));
-dynRange_dB  = -noiseFloor;      % positive value
+tailIdx     = max(1, N - floor(0.3*N) + 1) : N;
+noiseFloor  = median(EdB(tailIdx));
+dynRange_dB = -noiseFloor;      % positive value
 
 T = NaN;
-if dynRange_dB >= 35
-    T = fitSchroederSlope(EdB, t, -5, -35, 30);
-    if ~isnan(T), return; end
-end
 if dynRange_dB >= 25
-    T = fitSchroederSlope(EdB, t, -5, -25, 20);
+    T = fitSchroederSlope(EdB, t, -5, -25, 60);   % T20: fit 20 dB, extrapolate to 60
 end
 end
 
@@ -307,8 +348,10 @@ end
 function T = fitSchroederSlope(EdB, t, upper_dB, lower_dB, delta_dB)
 %FITSCHROEDERSLOPE  Linear fit to a dB segment of the Schroeder curve.
 %
-%   Fits a straight line to the segment [upper_dB, lower_dB] and extrapolates
-%   the slope to a DELTA_DB drop to recover the decay time.
+%   Fits a straight line to the segment of the Schroeder decay curve between
+%   UPPER_DB and LOWER_DB, then extrapolates the fitted slope to a total drop
+%   of DELTA_DB decibels.  Pass DELTA_DB = 60 to obtain a T60 estimate
+%   regardless of the fitting range.
 
 idx = find(EdB <= upper_dB & EdB >= lower_dB);
 if numel(idx) < 2
