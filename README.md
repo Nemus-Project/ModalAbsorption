@@ -1,4 +1,4 @@
-# polymaxRIR
+# Modal Absorption Coefficients
 
 Modal analysis, synthesis, and absorption measurement of room impulse responses using the PolyMax frequency-domain estimator.
 
