@@ -55,8 +55,8 @@ clear; close all; clc;
 %
 %   Example layout:
 %     ./measured_IRs/empty/    → results in outRootDir/empty/
-%     ./measured_IRs/specimen/ → results in outRootDir/St Gobain/
-inputFolder = './measured_IRs/St Gobain';
+%     ./measured_IRs/St Gobain/ → results in outRootDir/St Gobain/
+inputFolder = './measured_IRs/empty';
 
 % --- Input normalisation --------------------------------------------------
 normaliseInput = true;
@@ -78,7 +78,7 @@ customBandEdges = [50 100 200 400 800 1600 3200 4000];  % used only for 'custom'
 procBandWidth_Hz = 25;   % [Hz]  linear processing band width
 
 % --- Room geometry --------------------------------------------------------
-V_room  = 150;   % [m^3]
+V_room  = 277;   % [m^3]
 c_sound = 343;   % [m/s]
 
 % --- Transition frequency -------------------------------------------------
@@ -121,7 +121,7 @@ overlapFrac = 0.10;   % fractional band overlap for LS window
 % --- Gain outlier rejection -----------------------------------------------
 enableGainOutlierRejection = true;
 gainOutlierMethod          = 'mad';    % 'mad' | 'std'
-gainOutlierZthresh         = 6.0;
+gainOutlierZthresh         = 3.0;
 maxGainOutlierLSIters      = 5;
 minModesToKeepAfterReject  = 3;
 

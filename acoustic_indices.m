@@ -320,140 +320,135 @@ function T = estimateDecayTime(e, fs)
 %   followed by the Chu (1978) correction term, matching the default
 %   'cutWithCorrection' method of the ITA Toolbox.
 %
-%   ALGORITHM
-%     1. Smooth the squared IR into time blocks (frequency-adapted width).
-%     2. Estimate background noise level from the last 10 % of blocks.
-%     3. Linear regression on the smoothed decay to find a preliminary
-%        intersection time T_i (where signal meets noise floor).
-%     4. Iterate steps 2–3 using a refined block width until T_i converges
-%        (< 0.01 s change, max 30 iterations).
-%     5. Truncate the Schroeder integral at sample index corresponding to T_i.
-%     6. Add the Chu correction to compensate for the truncated exponential
-%        tail (ISO 3382-1:2009, Annex A):
-%            C = noise_power × T_late / (6 ln10) × fs
-%     7. Compute the corrected EDC in dB and fit T20 (−5 to −25 dB,
-%        extrapolated to 60 dB).  Returns NaN if dynamic range < 25 dB.
+%   Falls back to a plain Schroeder integral (simpleT20) when the signal
+%   is too short or the Lundeby iteration cannot converge.
 
 e = e(:);
 N = numel(e);
-if N < 10
-    T = NaN;
-    return;
-end
-
+if N < 10,  T = NaN;  return;  end
 t = (0 : N-1).' / fs;
 
-% ---- 1. Initial smoothing -----------------------------------------------
-%   Block width: ~30 ms, consistent with ITA broadband default.
-nBlk = max(1, round(0.030 * fs));
+% ---- constants (matching ITA defaults) ----------------------------------
+nPartsPer10dB    = 5;    % smoothing intervals per 10 dB of decay
+dbAboveNoise     = 10;   % regression stops this many dB above noise floor
+dynForReg        = 20;   % regression window width [dB]
+MAX_ITER         = 30;
+
+% ---- 1. Initial block-average (~30 ms blocks) ---------------------------
+nBlk  = max(1, round(0.030 * fs));
 nFull = floor(N / nBlk);
-if nFull < 3
-    % Signal too short for Lundeby — fall back to simple Schroeder
+if nFull < 4
     T = simpleT20(e, t, fs);
     return;
 end
-eBlk   = sum(reshape(e(1 : nFull*nBlk), nBlk, nFull), 1).' / nBlk;  % mean power per block
-tBlk   = ((0 : nFull-1).' + 0.5) * nBlk / fs;
+[eBlk, tBlk] = makeBlocks(e, N, nBlk, fs);
 
-% ---- 2. Initial noise estimate from last 10 % ---------------------------
-idxNoise = max(1, round(0.9 * nFull)) : nFull;
-noiseEst = max(mean(eBlk(idxNoise)), realmin);
+% ---- 2. Initial noise estimate (last 10 % of blocks) --------------------
+noiseEst = estimateNoise(eBlk);
 
 % ---- 3. Preliminary regression ------------------------------------------
 [~, iPeak] = max(eBlk);
-iStop = find(10*log10(eBlk(iPeak+1:end) + realmin) > 10*log10(noiseEst) + 10, ...
-             1, 'last');
+iStop = find(10*log10(eBlk(iPeak+1:end) + realmin) > ...
+             10*log10(noiseEst) + dbAboveNoise, 1, 'last');
 if isempty(iStop) || iStop < 2
     T = simpleT20(e, t, fs);
     return;
 end
 iStop = iStop + iPeak;
-X  = [ones(iStop - iPeak + 1, 1), tBlk(iPeak:iStop)];
-c  = X \ (10*log10(eBlk(iPeak:iStop) + realmin));
-if c(2) >= 0
+iStop = min(iStop, numel(eBlk));   % clamp
+
+[c, ok] = regressBlocks(eBlk, tBlk, iPeak, iStop);
+if ~ok
     T = simpleT20(e, t, fs);
     return;
 end
 crossPt = (10*log10(noiseEst) - c(1)) / c(2);
 
-% ---- 4. Lundeby iteration -----------------------------------------------
-nPartsPer10dB = 5;
-dbAboveNoise  = 10;
-dynForReg     = 20;
-MAX_ITER      = 30;
+% ---- 4. Refine block size before iteration ------------------------------
+%   nPartsPer10dB blocks per 10 dB of decay over [iPeak, iStop]
+dynRange_prelim = abs(diff(10*log10(eBlk([iPeak, iStop]) + realmin)));
+if dynRange_prelim < 1,  dynRange_prelim = 1;  end
+nBlkInDecay = max(1, dynRange_prelim / 10 * nPartsPer10dB);
+timeSpan    = tBlk(iStop) - tBlk(iPeak);
+nBlk        = max(1, min(round(timeSpan / nBlkInDecay * fs), round(0.1*fs)));
+nFull       = floor(N / nBlk);
+if nFull < 4
+    T = simpleT20(e, t, fs);
+    return;
+end
+[eBlk, tBlk] = makeBlocks(e, N, nBlk, fs);
+[~, iPeak]   = max(eBlk);
 
+% ---- 5. Lundeby iteration -----------------------------------------------
 for iter = 1 : MAX_ITER
-    % Refined block width
-    nBlkNew = round( diff(tBlk([iPeak, min(iStop, nFull)])) / ...
-                     (abs(diff(10*log10(eBlk([iPeak, min(iStop, nFull)]) + realmin))) / 10 * nPartsPer10dB) ...
-                     * fs );
-    nBlkNew = max(1, min(nBlkNew, round(0.1 * fs)));
 
-    nFullNew = floor(N / nBlkNew);
-    if nFullNew < 3, break; end
-    eBlk  = sum(reshape(e(1 : nFullNew*nBlkNew), nBlkNew, nFullNew), 1).' / nBlkNew;
-    tBlk  = ((0 : nFullNew-1).' + 0.5) * nBlkNew / fs;
-    [~, iPeak] = max(eBlk);
-
-    % Updated noise estimate: samples well below crossing point
-    idx10dBBefore = max(1, round((crossPt - dynForReg / abs(c(2))) * fs / nBlkNew));
-    idxNoise90    = max(1, round(0.9 * nFullNew));
+    % Estimate noise: from last 10% or 10 dB below crossing point
+    idx10dBBefore = max(1, round((crossPt - dynForReg / max(abs(c(2)), 0.1)) * fs / nBlk));
+    idxNoise90    = max(1, round(0.9 * numel(eBlk)));
     idxNoiseStart = min(idxNoise90, idx10dBBefore);
-    noiseEst = max(mean(eBlk(idxNoiseStart : end)), realmin);
+    noiseEst      = estimateNoise(eBlk(idxNoiseStart:end));
 
-    % Updated regression window
-    iStart2 = find(10*log10(eBlk(iPeak:end) + realmin) < 10*log10(noiseEst) + dbAboveNoise + dynForReg, ...
-                   1, 'first');
-    if isempty(iStart2), break; end
-    iStart2 = iStart2 + iPeak - 1;
-    iStop2  = find(10*log10(eBlk(iStart2+1:end) + realmin) < 10*log10(noiseEst) + dbAboveNoise, ...
-                   1, 'first');
-    if isempty(iStop2), break; end
-    iStop2 = iStop2 + iStart2;
+    % Find regression window
+    iStart2 = find(10*log10(eBlk(iPeak:end) + realmin) < ...
+                   10*log10(noiseEst) + dbAboveNoise + dynForReg, 1, 'first');
+    if isempty(iStart2),  break;  end
+    iStart2 = min(iStart2 + iPeak - 1, numel(eBlk));
 
-    X  = [ones(iStop2 - iStart2 + 1, 1), tBlk(iStart2:iStop2)];
-    c  = X \ (10*log10(eBlk(iStart2:iStop2) + realmin));
-    if c(2) >= 0, break; end
+    iStop2 = find(10*log10(eBlk(iStart2+1:end) + realmin) < ...
+                  10*log10(noiseEst) + dbAboveNoise, 1, 'first');
+    if isempty(iStop2),  break;  end
+    iStop2 = min(iStop2 + iStart2, numel(eBlk));   % clamp
+
+    if iStop2 <= iStart2,  break;  end
+
+    [c, ok] = regressBlocks(eBlk, tBlk, iStart2, iStop2);
+    if ~ok,  break;  end
 
     oldCrossPt = crossPt;
     crossPt    = (10*log10(noiseEst) - c(1)) / c(2);
 
-    if abs(crossPt - oldCrossPt) < 0.01, break; end
+    if abs(crossPt - oldCrossPt) < 0.01,  break;  end
 end
 
-% ---- 5. Truncate at intersection time -----------------------------------
-%   Clamp to within the actual signal; guard against negative crossPt.
-crossPt  = max(0, min(crossPt, t(end)));
-iCut     = min(N, max(1, round(crossPt * fs)));
+% ---- 6. Truncate and apply Chu correction -------------------------------
+crossPt = max(0, min(crossPt, t(end)));
+iCut    = min(N, max(1, round(crossPt * fs)));
 
-% ---- 6. Chu correction --------------------------------------------------
-%   T_late estimated from the converged regression slope.
-if c(2) < 0
-    T_late = -60 / c(2);
-else
-    T_late = 3 * log(10) / max(noiseEst, 1e-30);  % fallback
-end
-C_chu = noiseEst * T_late / (6 * log(10)) * fs;   % added to backward sum
+T_late  = -60 / min(c(2), -0.01);          % T60 from regression slope
+C_chu   = noiseEst * T_late / (6*log(10)) * fs;
 
-% ---- 7. Corrected Schroeder integral and T20 fit ------------------------
-E   = flipud(cumsum(e(iCut:-1:1))) + C_chu;
-mx  = max(E);
-if mx <= 0
-    T = NaN;
-    return;
-end
-EdB  = 10*log10(E / mx + eps);
+% ---- 7. Corrected EDC and T20 fit ---------------------------------------
+E  = flipud(cumsum(e(iCut:-1:1))) + C_chu;
+mx = max(E);
+if mx <= 0,  T = NaN;  return;  end
+EdB = 10*log10(E / mx + eps);
 tCut = t(1:iCut);
 
-% Dynamic range check
-tailIdx     = max(1, numel(EdB) - floor(0.3 * numel(EdB)) + 1) : numel(EdB);
-noiseFloor  = median(EdB(tailIdx));
-if -noiseFloor < 25
-    T = NaN;
-    return;
-end
+tailIdx = max(1, numel(EdB) - floor(0.3*numel(EdB)) + 1) : numel(EdB);
+if -median(EdB(tailIdx)) < 25,  T = NaN;  return;  end
 
 T = fitSchroederSlope(EdB, tCut, -5, -25, 60);
+end
+
+% ---- helpers ------------------------------------------------------------
+
+function [eB, tB] = makeBlocks(e, N, nBlk, fs)
+nF  = floor(N / nBlk);
+eB  = sum(reshape(e(1:nF*nBlk), nBlk, nF), 1).' / nBlk;
+tB  = ((0:nF-1).' + 0.5) * nBlk / fs;
+end
+
+function n = estimateNoise(eBlk)
+n = max(mean(eBlk(max(1, round(0.9*numel(eBlk))):end)), realmin);
+end
+
+function [c, ok] = regressBlocks(eBlk, tBlk, i1, i2)
+i1 = max(1, i1);  i2 = min(numel(eBlk), i2);
+ok = false;  c = [0; -1];
+if i2 <= i1,  return;  end
+X = [ones(i2-i1+1, 1), tBlk(i1:i2)];
+c = X \ (10*log10(eBlk(i1:i2) + realmin));
+ok = (c(2) < 0);
 end
 
 % -------------------------------------------------------------------------

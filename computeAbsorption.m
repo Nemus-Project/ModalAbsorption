@@ -69,14 +69,14 @@ outDir      = './polymaxRIR_results/comparison';
 %   c_sound   : speed of sound [m/s]
 %   S_spec    : one-sided area of the absorption specimen [m²]
 %                (the area that faces the room — do NOT double-count)
-V_room  = 120;    % [m³]
+V_room  = 277;    % [m³]
 c_sound = 343;    % [m/s]
 S_spec  = 10;    % [m²]
 
 % --- Band resolution for output -------------------------------------------
 %   'fullOctave' | 'thirdOctave'
 %   Must match bandMode used in analyseResults.m so that dispEdges aligns.
-bandMode = 'fullOctave';
+bandMode = 'thirdOctave';
 
 % --- Amplitude-weighting --------------------------------------------------
 %   When true, per-mode α estimates are weighted by the mean residue
@@ -288,13 +288,13 @@ rWeight = rWeight / (max(rWeight, [], 'omitnan') + eps);
 
 % Hard-clamp α to [0,1]
 alphaMod_raw_wls = alphaMod_wls;
-alphaMod_wls     = max(0, min(1, alphaMod_wls));
+alphaMod_wls     = max(0, alphaMod_wls);   % no upper clamp — values > 1 are physically informative
 
 % Keep simple basis-median estimate for reference
 rMag         = mean(rMat_E, 2, 'omitnan');
 rMag         = rMag / (max(rMag) + eps);
 deltaC       = cBasis_S - cBasis_E;
-alphaMod     = max(0, min(1, deltaC / K_abs));
+alphaMod     = max(0, deltaC / K_abs);
 alphaMod_raw = deltaC / K_abs;
 
 if verbose
@@ -375,7 +375,7 @@ for ib = 1 : NDispBands
     T60_S = specimenMeanT60(ib);
     if isnan(T60_E) || isnan(T60_S) || T60_E <= 0 || T60_S <= 0, continue; end
     deltaA          = K * (1/T60_S - 1/T60_E);
-    alphaHF_PM(ib)  = max(0, min(1, deltaA / S_spec));
+    alphaHF_PM(ib)  = max(0, deltaA / S_spec);
     % Uncertainty from T60 std via Gaussian error propagation:
     % σ_α ≈ (K/S_spec) · √( (σ_S/T60_S²)² + (σ_E/T60_E²)² )
     sE = emptyStdT60(ib);   sS = specimenStdT60(ib);
@@ -392,7 +392,7 @@ for ib = 1 : NDispBands
     T60_S = specimenMeanAIT20(ib);
     if isnan(T60_E) || isnan(T60_S) || T60_E <= 0 || T60_S <= 0, continue; end
     deltaA      = K * (1/T60_S - 1/T60_E);
-    alphaAI(ib) = max(0, min(1, deltaA / S_spec));
+    alphaAI(ib) = max(0, deltaA / S_spec);
 end
 alphaHF_AI = alphaAI;   % keep for backward-compat in saved struct
 
@@ -450,7 +450,8 @@ hFig = figure('Name', 'Absorption coefficient', ...
     'Color', 'w', 'Position', [100 100 1050 560]);
 hold on;
 
-yLim_guess = 1.1;
+yLim_guess = max(1.15, max([alphaLF, alphaHF_PM, alphaAI], [], 'omitnan') * 1.1 + 0.05);
+if isnan(yLim_guess) || yLim_guess <= 0, yLim_guess = 1.15; end
 patch([dispEdges(1), fTransition, fTransition, dispEdges(1)], ...
     [0, 0, yLim_guess, yLim_guess], ...
     [0.92 0.96 0.92], 'EdgeColor', 'none', 'FaceAlpha', 0.5, ...
@@ -499,12 +500,13 @@ if any(hasLF)
     end
 end
 
-yline(1, 'k:', 'LineWidth', 0.8, 'HandleVisibility', 'off');
+yline(1, 'k--', 'LineWidth', 1.2, 'Label', '\alpha = 1', ...
+    'LabelVerticalAlignment', 'bottom', 'HandleVisibility', 'off');
 xline(fTransition, '-', 'Color', colSch, 'LineWidth', 1.5, ...
     'Label', 'f_{Sch}', 'LabelVerticalAlignment', 'top', 'HandleVisibility', 'off');
-text(fTransition * 0.55, 1.06, 'LF  (modal \Deltac)', ...
+text(fTransition * 0.55, min(yLim_guess * 0.96, 1.08), 'LF  (modal \Deltac)', ...
     'HorizontalAlignment', 'right', 'Color', [0.3 0.55 0.3], 'FontSize', 9);
-text(fTransition * 1.45, 1.06, 'HF  (Sabine)', ...
+text(fTransition * 1.45, min(yLim_guess * 0.96, 1.08), 'HF  (Sabine)', ...
     'HorizontalAlignment', 'left',  'Color', [0.3 0.55 0.3], 'FontSize', 9);
 
 set(gca, 'XScale', 'log');
@@ -532,7 +534,8 @@ sc = scatter(fBasis(lfMask), alphaMod_wls(lfMask), 30, ...
 colormap(gca, parula);  cb = colorbar;
 cb.Label.String = 'Reliability  (amplitude \times consistency)';
 clim([0, 1]);
-yline(1, 'k:', 'LineWidth', 0.8, 'HandleVisibility', 'off');
+yline(1, 'k--', 'LineWidth', 1.2, 'Label', '\alpha = 1', ...
+    'LabelVerticalAlignment', 'bottom', 'HandleVisibility', 'off');
 yline(0, 'k:', 'LineWidth', 0.8, 'HandleVisibility', 'off');
 xline(fTransition, '--', 'Color', colSch, 'LineWidth', 1.2, ...
     'Label', 'f_{Sch}', 'HandleVisibility', 'off');
@@ -541,7 +544,7 @@ ylabel('\alpha_{spec,p}  (per mode)');
 title({'Per-mode \alpha_{spec}  (all-pairs WLS)', ...
     sprintf('up to %d pairs/mode  (N_E=%d × N_S=%d)', ...
     NEmpty*NSpecimen, NEmpty, NSpecimen)});
-grid on;  box on;  ylim([0, 1.05]);
+grid on;  box on;
 
 subplot(1, 2, 2);
 hold on;

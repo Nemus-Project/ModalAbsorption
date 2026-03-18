@@ -32,11 +32,6 @@
 %                  frequency shift and relative T60 change per mode
 %   6.  Save all figures as .fig and one comparison .mat summary.
 %
-% EXPECTED RESULT
-%   Modal frequencies below the Schroeder frequency (fTransition) are set
-%   by room geometry and should be largely unaffected by the specimen.
-%   Modal decay times (T60 = 3·ln10/c) are set by absorption and should
-%   decrease substantially when the specimen is present.
 %
 % DEPENDENCIES
 %   Output .mat files from polymaxRIR.m  (batch mode, two folders).
@@ -78,7 +73,7 @@ minFileFraction = 0.4;   % [0, 1]
 %   the console table.  Independent of the LS fitting bands below.
 %   'fullOctave'  — ISO 266 octave bands  (63, 125, 250 … Hz)
 %   'thirdOctave' — ISO 266 third-octave bands
-bandMode = 'fullOctave';
+bandMode = 'thirdOctave';
 
 % --- LS amplitude re-fit --------------------------------------------------
 %   lsBandWidth_Hz  : width of the linear bands used for the LS amplitude
