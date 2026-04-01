@@ -1,16 +1,16 @@
 %==========================================================================
 % analyseResults.m
 %==========================================================================
-% Post-processing script for polymaxRIR batch results.
+% Post-processing script for modalRIR batch results.
 %
 % PURPOSE
 %   Compare two measurement conditions — an empty reverberant room and the
 %   same room loaded with an absorption specimen — by analysing the modal
-%   parameters extracted by polymaxRIR.m across all source–receiver
+%   parameters extracted by modalRIR.m across all source–receiver
 %   combinations in each condition.
 %
 % WORKFLOW
-%   1.  Load all *_polymaxRIR.mat files from the two result folders.
+%   1.  Load all *_modalRIR.mat files from the two result folders.
 %   2.  For each condition, pool poles from all IRs and vote on a COMMON
 %       POLE BASIS: a frequency bin enters the basis only if it receives
 %       a pole contribution from at least minFileFraction of the IRs.
@@ -23,18 +23,24 @@
 %   4.  Compute per-display-band T60 statistics across all IRs for each
 %       condition, from the original per-IR poleStats (not the re-fit).
 %       Also extract the acoustic-indices T20 per IR for the same bands.
-%   5.  Produce four figures:
+%   5.  Produce eight figures:
 %         Fig. 1 — Pole-frequency density histograms (LF and HF regimes)
 %         Fig. 2 — Per-IR T60 spaghetti plots (inter-measurement spread)
 %         Fig. 3 — MAIN RESULT: mean ± 1σ T60 per band, empty vs specimen,
 %                  overlaid with acoustic-indices T20 for both conditions
-%         Fig. 4 — Matched-basis analysis below fTransition:
-%                  frequency shift and relative T60 change per mode
+%         Fig. 4 — Spaghetti + final overlay: per-IR faint traces with
+%                  mean ± 1σ T60 from modal and AI methods (one panel per
+%                  condition)
+%         Fig. 5 — Multi-metric heatmap: IRs × bands × {T60, C80, modes}
+%         Fig. 6 — Spatial consistency radar: per-IR T60, C80, BR, TR, Ts
+%         Fig. 7 — Correlation scatter matrix: T60 vs C80 vs density
+%         Fig. 8 — Per-IR strip plot: jittered dots for T60, C80, modes
+%         (Former Fig. 5 — Matched-basis analysis moved to Fig. 9)
 %   6.  Save all figures as .fig and one comparison .mat summary.
 %
 %
 % DEPENDENCIES
-%   Output .mat files from polymaxRIR.m  (batch mode, two folders).
+%   Output .mat files from modalRIR.m  (batch mode, two folders).
 %
 % Author: Michele Ducceschi, March 2026
 %==========================================================================
@@ -44,13 +50,13 @@ clear; close all; clc;
 %% ========================== USER PARAMETERS ==============================
 
 % --- Result folders -------------------------------------------------------
-%   Set these to the subfolders created by polymaxRIR.m batch mode.
-%   Each folder should contain one *_polymaxRIR.mat file per IR.
-emptyDir    = './polymaxRIR_results/empty';
-specimenDir = './polymaxRIR_results/St Gobain';
+%   Set these to the subfolders created by modalRIR.m batch mode.
+%   Each folder should contain one *_modalRIR.mat file per IR.
+emptyDir    = './modalRIR_results/empty';
+specimenDir = './modalRIR_results/empty';
 
 % --- Output ---------------------------------------------------------------
-outDir  = './polymaxRIR_results/comparison';
+outDir  = './modalRIR_results/comparison';
 verbose = true;
 
 % --- Common-basis clustering ----------------------------------------------
@@ -81,13 +87,13 @@ bandMode = 'thirdOctave';
 %                     band contains too many basis poles — otherwise the
 %                     normal-equation matrix becomes large and slow.
 %                     Rule of thumb: similar to procBandWidth_Hz used in
-%                     polymaxRIR (typically 25–100 Hz).  Wide octave display
+%                     modalRIR (typically 25–100 Hz).  Wide octave display
 %                     bands are NOT used for fitting — this parameter is
 %                     independent of bandMode.
 %   overlapFrac     : fractional extension of each LS window beyond the
 %                     linear band edges (reduces boundary artefacts).
 %   MinSecondsForFFT: FFT zero-padding floor [s].  Match the value used in
-%                     polymaxRIR.m so that fv grids are identical.
+%                     modalRIR.m so that fv grids are identical.
 lsBandWidth_Hz     = 50;    % [Hz]  linear LS band width
 overlapFrac        = 0.10;
 MinSecondsForFFT   = 10;
@@ -111,15 +117,24 @@ specimenSubDir = fullfile(outDir, 'specimen');
 skipSynthesis = false;
 if exist(compMatPath, 'file')
     fprintf('\nFound existing comparison.mat — checking per-IR cache...\n');
-    nExpectedEmpty    = numel(dir(fullfile(emptyDir,    '*_polymaxRIR.mat')));
-    nExpectedSpecimen = numel(dir(fullfile(specimenDir, '*_polymaxRIR.mat')));
+    nExpectedEmpty    = numel(dir(fullfile(emptyDir,    '*_modalRIR.mat')));
+    nExpectedSpecimen = numel(dir(fullfile(specimenDir, '*_modalRIR.mat')));
     nCachedEmpty      = numel(dir(fullfile(emptySubDir,    '*_commonBasis.mat')));
     nCachedSpecimen   = numel(dir(fullfile(specimenSubDir, '*_commonBasis.mat')));
     if nCachedEmpty    == nExpectedEmpty    && nExpectedEmpty    > 0 && ...
        nCachedSpecimen == nExpectedSpecimen && nExpectedSpecimen > 0
-        fprintf('Cache complete (%d + %d per-IR MATs) — skipping synthesis.\n', ...
-            nCachedEmpty, nCachedSpecimen);
-        skipSynthesis = true;
+        % Check that the cached MAT has the newer fields (C80, modes, etc.)
+        compFields = whos('-file', compMatPath);
+        compFieldNames = {compFields.name};
+        requiredNewFields = {'emptyC80mat', 'emptyNmodesMat', 'emptyBR'};
+        hasNewFields = all(ismember(requiredNewFields, compFieldNames));
+        if hasNewFields
+            fprintf('Cache complete (%d + %d per-IR MATs) — skipping synthesis.\n', ...
+                nCachedEmpty, nCachedSpecimen);
+            skipSynthesis = true;
+        else
+            fprintf('Cache outdated (missing new fields) — running full pipeline.\n');
+        end
     else
         fprintf('Cache incomplete (%d/%d empty, %d/%d specimen) — running full pipeline.\n', ...
             nCachedEmpty, nExpectedEmpty, nCachedSpecimen, nExpectedSpecimen);
@@ -143,6 +158,22 @@ if skipSynthesis
     emptyStdAIT20     = compS.emptyStdAIT20;
     specimenMeanAIT20 = compS.specimenMeanAIT20;
     specimenStdAIT20  = compS.specimenStdAIT20;
+    emptyAIT20mat     = compS.emptyAIT20mat;
+    specimenAIT20mat  = compS.specimenAIT20mat;
+    emptyC80mat       = compS.emptyC80mat;
+    specimenC80mat    = compS.specimenC80mat;
+    emptyNmodesMat    = compS.emptyNmodesMat;
+    specimenNmodesMat = compS.specimenNmodesMat;
+    emptyDensMat      = compS.emptyDensMat;
+    specimenDensMat   = compS.specimenDensMat;
+    emptyBR           = compS.emptyBR;
+    emptyTR           = compS.emptyTR;
+    emptyTs           = compS.emptyTs;
+    emptyNRMSE        = compS.emptyNRMSE;
+    specimenBR        = compS.specimenBR;
+    specimenTR        = compS.specimenTR;
+    specimenTs        = compS.specimenTs;
+    specimenNRMSE     = compS.specimenNRMSE;
     emptyBasisT60     = compS.emptyBasisT60;
     specimenBasisT60  = compS.specimenBasisT60;
     dispEdges         = compS.dispEdges;
@@ -228,6 +259,22 @@ emptyMeanAIT20    = mean(emptyAIT20mat,    1, 'omitnan');
 emptyStdAIT20     = std( emptyAIT20mat,    0, 1, 'omitnan');
 specimenMeanAIT20 = mean(specimenAIT20mat, 1, 'omitnan');
 specimenStdAIT20  = std( specimenAIT20mat, 0, 1, 'omitnan');
+
+% C80 per file, mapped to display bands
+emptyC80mat    = extractC80matrix(emptyData,    dispEdges, dispCentres, NDispBands);
+specimenC80mat = extractC80matrix(specimenData, dispEdges, dispCentres, NDispBands);
+
+% Mode count per file per display band
+emptyNmodesMat    = extractModeCountMatrix(emptyData,    dispEdges, NDispBands);
+specimenNmodesMat = extractModeCountMatrix(specimenData, dispEdges, NDispBands);
+
+% Modal density [modes/Hz] per file per display band
+emptyDensMat    = emptyNmodesMat    ./ diff(dispEdges);
+specimenDensMat = specimenNmodesMat ./ diff(dispEdges);
+
+% Scalar metrics per IR: BR, TR, Ts, nRMSE
+[emptyBR,    emptyTR,    emptyTs,    emptyNRMSE]    = extractScalarMetrics(emptyData);
+[specimenBR, specimenTR, specimenTs, specimenNRMSE] = extractScalarMetrics(specimenData);
 
 % T60 derived directly from the common basis damping (single consensus value)
 emptyBasisT60    = basisT60perBand(emptyBasis,    dispEdges, NDispBands);
@@ -414,8 +461,389 @@ text(fTransition * 1.45, yLim_guess * 0.96, 'HF  (diffuse)', ...
     'HorizontalAlignment', 'left',  'Color', [0.3 0.55 0.3], 'FontSize', 9);
 
 title({'T_{60} per band: empty vs specimen', ...
-    '(solid = PolyMax modal fit,  dashed = acoustic-indices T_{20})'}, ...
+    '(solid = modal fit,  dashed = acoustic-indices T_{20})'}, ...
     'FontSize', 12);
+
+%--------------------------------------------------------------------------
+%  Figure 4 — SPAGHETTI + FINAL T60 OVERLAY
+%
+%   Combines the per-IR spaghetti (faint traces showing inter-measurement
+%   spread) with the final mean ± 1σ T60 from both the modal method and
+%   the acoustic-indices T20.  Each condition (empty / specimen) gets its
+%   own subplot so the four layers of information remain readable:
+%     • faint lines  = individual IR T60 per band  (spaghetti)
+%     • solid error bars = modal T60 mean ± 1σ across IRs
+%     • dashed error bars = acoustic-indices T20 mean ± 1σ across IRs
+%--------------------------------------------------------------------------
+hFig4 = figure('Name', 'T60 spaghetti + final overlay', ...
+    'Color', 'w', 'Position', [1400 620 1200 550]);
+
+colAI_E = colEmpty    * 0.55 + [0.45 0.45 0.45];   % lighter blue
+colAI_S = colSpecimen * 0.55 + [0.45 0.45 0.45];   % lighter red
+
+% Also extract AI T20 spaghetti (per-IR) for the overlay —
+% use the matrices already computed above
+emptyAI_spag    = emptyAIT20mat;
+specimenAI_spag = specimenAIT20mat;
+
+yMax4 = max([emptyMeanT60 + emptyStdT60, ...
+             specimenMeanT60 + specimenStdT60, ...
+             emptyMeanAIT20 + emptyStdAIT20, ...
+             specimenMeanAIT20 + specimenStdAIT20], [], 'omitnan') * 1.25;
+if isnan(yMax4) || yMax4 <= 0, yMax4 = 5; end
+
+% --- Left panel: Empty room ---
+subplot(1, 2, 1);
+hold on;
+
+% LF shading
+patch([dispEdges(1), fTransition, fTransition, dispEdges(1)], ...
+    [0, 0, yMax4, yMax4], ...
+    [0.92 0.96 0.92], 'EdgeColor', 'none', 'FaceAlpha', 0.5, ...
+    'HandleVisibility', 'off');
+
+% Spaghetti: modal T60 per IR
+for iF = 1 : NEmpty
+    hh = semilogx(dispCentres, emptyT60mat(iF, :), '-', ...
+        'Color', colEmpty, 'LineWidth', 0.6, 'HandleVisibility', 'off');
+    hh.Color(4) = 0.15;
+end
+% Spaghetti: AI T20 per IR
+for iF = 1 : NEmpty
+    hh = semilogx(dispCentres, emptyAI_spag(iF, :), '-', ...
+        'Color', colAI_E, 'LineWidth', 0.6, 'HandleVisibility', 'off');
+    hh.Color(4) = 0.15;
+end
+
+% Final: modal T60 mean ± 1σ
+errorbar(dispCentres, emptyMeanT60, emptyStdT60, ...
+    'o-', 'Color', colEmpty, 'MarkerFaceColor', colEmpty, ...
+    'MarkerSize', 6, 'LineWidth', 2.0, 'CapSize', 6, ...
+    'DisplayName', 'Modal T_{60}  (mean \pm 1\sigma)');
+% Final: AI T20 mean ± 1σ
+errorbar(dispCentres, emptyMeanAIT20, emptyStdAIT20, ...
+    's--', 'Color', colAI_E, 'MarkerFaceColor', 'none', ...
+    'MarkerSize', 6, 'LineWidth', 1.5, 'CapSize', 5, ...
+    'DisplayName', 'AI T_{20}  (mean \pm 1\sigma)');
+
+xline(fTransition, '-', 'Color', colSch, 'LineWidth', 1.3, ...
+    'Label', 'f_{Sch}', 'LabelVerticalAlignment', 'top');
+set(gca, 'XScale', 'log');
+xlabel('f_c (Hz)');  ylabel('T_{60}  (s)');
+xlim([dispEdges(1), dispEdges(end)]);  ylim([0, yMax4]);
+legend('show', 'Location', 'best', 'FontSize', 9);
+grid on;  box on;
+title('Empty room', 'FontSize', 11, 'FontWeight', 'bold');
+
+% --- Right panel: Specimen room ---
+subplot(1, 2, 2);
+hold on;
+
+patch([dispEdges(1), fTransition, fTransition, dispEdges(1)], ...
+    [0, 0, yMax4, yMax4], ...
+    [0.96 0.92 0.92], 'EdgeColor', 'none', 'FaceAlpha', 0.5, ...
+    'HandleVisibility', 'off');
+
+% Spaghetti: modal T60 per IR
+for iF = 1 : NSpecimen
+    hh = semilogx(dispCentres, specimenT60mat(iF, :), '-', ...
+        'Color', colSpecimen, 'LineWidth', 0.6, 'HandleVisibility', 'off');
+    hh.Color(4) = 0.15;
+end
+% Spaghetti: AI T20 per IR
+for iF = 1 : NSpecimen
+    hh = semilogx(dispCentres, specimenAI_spag(iF, :), '-', ...
+        'Color', colAI_S, 'LineWidth', 0.6, 'HandleVisibility', 'off');
+    hh.Color(4) = 0.15;
+end
+
+% Final: modal T60 mean ± 1σ
+errorbar(dispCentres, specimenMeanT60, specimenStdT60, ...
+    'o-', 'Color', colSpecimen, 'MarkerFaceColor', colSpecimen, ...
+    'MarkerSize', 6, 'LineWidth', 2.0, 'CapSize', 6, ...
+    'DisplayName', 'Modal T_{60}  (mean \pm 1\sigma)');
+% Final: AI T20 mean ± 1σ
+errorbar(dispCentres, specimenMeanAIT20, specimenStdAIT20, ...
+    's--', 'Color', colAI_S, 'MarkerFaceColor', 'none', ...
+    'MarkerSize', 6, 'LineWidth', 1.5, 'CapSize', 5, ...
+    'DisplayName', 'AI T_{20}  (mean \pm 1\sigma)');
+
+xline(fTransition, '-', 'Color', colSch, 'LineWidth', 1.3, ...
+    'Label', 'f_{Sch}', 'LabelVerticalAlignment', 'top');
+set(gca, 'XScale', 'log');
+xlabel('f_c (Hz)');  ylabel('T_{60}  (s)');
+xlim([dispEdges(1), dispEdges(end)]);  ylim([0, yMax4]);
+legend('show', 'Location', 'best', 'FontSize', 9);
+grid on;  box on;
+title('Specimen room', 'FontSize', 11, 'FontWeight', 'bold');
+
+sgtitle({'Per-IR T_{60} spaghetti (faint) with final mean \pm 1\sigma overlay', ...
+    '(solid = modal fit,  dashed = acoustic-indices T_{20})'}, ...
+    'FontSize', 12, 'FontWeight', 'bold');
+
+%--------------------------------------------------------------------------
+%  Figure 5 — MULTI-METRIC HEATMAP GRID
+%
+%   Rows = IRs, columns = frequency bands.  One panel per metric per
+%   condition.  Shows every single measurement at a glance.
+%--------------------------------------------------------------------------
+hFig5 = figure('Name', 'Multi-metric heatmap', ...
+    'Color', 'w', 'Position', [50 50 1500 900]);
+
+% Band labels (short)
+xLab5 = arrayfun(@(f) sprintf('%.0f', f), dispCentres, 'UniformOutput', false);
+
+% Row labels: IR index
+yLabE = arrayfun(@(k) sprintf('E%d', k), 1:NEmpty,    'UniformOutput', false);
+yLabS = arrayfun(@(k) sprintf('S%d', k), 1:NSpecimen, 'UniformOutput', false);
+
+metricNames = {'T_{60} (s)', 'C_{80} (dB)', 'Mode count'};
+emptyMats   = {emptyT60mat,    emptyC80mat,    emptyNmodesMat};
+specMats    = {specimenT60mat, specimenC80mat, specimenNmodesMat};
+cmaps       = {parula, flipud(hot), summer};
+
+for im = 1 : 3
+    % Empty
+    subplot(2, 3, im);
+    imagesc(emptyMats{im});
+    colormap(gca, cmaps{im}); colorbar;
+    set(gca, 'XTick', 1:NDispBands, 'XTickLabel', xLab5, ...
+        'YTick', 1:NEmpty, 'YTickLabel', yLabE);
+    xtickangle(60);
+    xlabel('f_c (Hz)');  ylabel('IR index');
+    title(sprintf('Empty — %s', metricNames{im}), 'FontSize', 10);
+
+    % Specimen
+    subplot(2, 3, im + 3);
+    imagesc(specMats{im});
+    colormap(gca, cmaps{im}); colorbar;
+    set(gca, 'XTick', 1:NDispBands, 'XTickLabel', xLab5, ...
+        'YTick', 1:NSpecimen, 'YTickLabel', yLabS);
+    xtickangle(60);
+    xlabel('f_c (Hz)');  ylabel('IR index');
+    title(sprintf('Specimen — %s', metricNames{im}), 'FontSize', 10);
+end
+
+sgtitle(sprintf('Multi-metric heatmap  (%d empty + %d specimen IRs × %d bands)', ...
+    NEmpty, NSpecimen, NDispBands), 'FontSize', 13, 'FontWeight', 'bold');
+
+%--------------------------------------------------------------------------
+%  Figure 6 — SPATIAL CONSISTENCY RADAR
+%
+%   Each IR is a semi-transparent polygon on a radar/spider chart.
+%   Spokes: mean T60, mean C80, BR, TR, Ts.
+%   Shows at a glance how spatially consistent each metric is.
+%--------------------------------------------------------------------------
+hFig6 = figure('Name', 'Spatial consistency radar', ...
+    'Color', 'w', 'Position', [50 50 1200 550]);
+
+spokeLabels = {'mean T_{60}', 'mean C_{80}', 'BR', 'TR', 'T_s'};
+NSp = numel(spokeLabels);
+angles = linspace(0, 2*pi, NSp + 1);  angles = angles(1:end-1);
+
+% Assemble raw per-IR vectors
+emptyRaw    = [mean(emptyT60mat, 2, 'omitnan'), ...
+               mean(emptyC80mat, 2, 'omitnan'), ...
+               emptyBR(:), emptyTR(:), emptyTs(:)];
+specimenRaw = [mean(specimenT60mat, 2, 'omitnan'), ...
+               mean(specimenC80mat, 2, 'omitnan'), ...
+               specimenBR(:), specimenTR(:), specimenTs(:)];
+
+% Normalise each spoke to [0,1] across BOTH conditions for fair comparison
+allRaw = [emptyRaw; specimenRaw];
+spokeMin = min(allRaw, [], 1, 'omitnan');
+spokeMax = max(allRaw, [], 1, 'omitnan');
+spokeRange = spokeMax - spokeMin;
+spokeRange(spokeRange == 0) = 1;
+emptyNorm    = (emptyRaw    - spokeMin) ./ spokeRange;
+specimenNorm = (specimenRaw - spokeMin) ./ spokeRange;
+
+for iPanel = 1 : 2
+    subplot(1, 2, iPanel);
+    hold on;
+    if iPanel == 1
+        dataNorm = emptyNorm;  col = colEmpty;  ttl = 'Empty';
+    else
+        dataNorm = specimenNorm; col = colSpecimen; ttl = 'Specimen';
+    end
+
+    % Draw spoke grid
+    for r = 0.25 : 0.25 : 1.0
+        xGrid = r * cos([angles, angles(1)]);
+        yGrid = r * sin([angles, angles(1)]);
+        plot(xGrid, yGrid, '-', 'Color', [0.85 0.85 0.85], ...
+            'HandleVisibility', 'off');
+    end
+    for iS = 1 : NSp
+        plot([0, cos(angles(iS))], [0, sin(angles(iS))], '-', ...
+            'Color', [0.7 0.7 0.7], 'HandleVisibility', 'off');
+        text(1.12*cos(angles(iS)), 1.12*sin(angles(iS)), spokeLabels{iS}, ...
+            'HorizontalAlignment', 'center', 'FontSize', 9);
+    end
+
+    % Per-IR polygons (faint)
+    for iF = 1 : size(dataNorm, 1)
+        vals = dataNorm(iF, :);
+        if any(isnan(vals)), continue; end
+        xP = vals .* cos(angles);
+        yP = vals .* sin(angles);
+        hh = fill([xP, xP(1)], [yP, yP(1)], col, ...
+            'FaceAlpha', 0.08, 'EdgeColor', col, 'EdgeAlpha', 0.3, ...
+            'LineWidth', 0.5, 'HandleVisibility', 'off');
+    end
+
+    % Mean polygon (bold)
+    mVals = mean(dataNorm, 1, 'omitnan');
+    xM = mVals .* cos(angles);
+    yM = mVals .* sin(angles);
+    plot([xM, xM(1)], [yM, yM(1)], '-', 'Color', col, ...
+        'LineWidth', 2.5, 'DisplayName', 'Mean');
+    plot(xM, yM, 'o', 'Color', col, 'MarkerFaceColor', col, ...
+        'MarkerSize', 6, 'HandleVisibility', 'off');
+
+    axis equal; axis off;
+    xlim([-1.4, 1.4]); ylim([-1.4, 1.4]);
+    title(sprintf('%s  (%d IRs)', ttl, size(dataNorm, 1)), ...
+        'FontSize', 11, 'FontWeight', 'bold');
+    legend('show', 'Location', 'southeast', 'FontSize', 9);
+end
+
+sgtitle('Spatial consistency: per-IR radar overlay  (spokes normalised to [0, 1])', ...
+    'FontSize', 12, 'FontWeight', 'bold');
+
+%--------------------------------------------------------------------------
+%  Figure 7 — CORRELATION SCATTER MATRIX
+%
+%   Pairwise scatter of per-IR band-averaged metrics: T60, C80, modal
+%   density.  Off-diagonal = scatter; diagonal = histogram.  Both
+%   conditions overlaid.
+%--------------------------------------------------------------------------
+hFig7 = figure('Name', 'Correlation scatter matrix', ...
+    'Color', 'w', 'Position', [50 50 950 900]);
+
+% Build per-IR × per-band long vectors (flatten both dims)
+%   Each data point = one (IR, band) observation.
+eT60_long  = emptyT60mat(:);
+sT60_long  = specimenT60mat(:);
+eC80_long  = emptyC80mat(:);
+sC80_long  = specimenC80mat(:);
+eDens_long = emptyDensMat(:);
+sDens_long = specimenDensMat(:);
+
+corrNames = {'T_{60} (s)', 'C_{80} (dB)', 'Modal density (modes/Hz)'};
+eVars = {eT60_long, eC80_long, eDens_long};
+sVars = {sT60_long, sC80_long, sDens_long};
+Nv = numel(corrNames);
+
+for ir = 1 : Nv
+    for ic = 1 : Nv
+        subplot(Nv, Nv, (ir-1)*Nv + ic);
+        hold on;
+        if ir == ic
+            % Diagonal: histograms
+            eOK = ~isnan(eVars{ir});
+            sOK = ~isnan(sVars{ir});
+            if any(eOK)
+                histogram(eVars{ir}(eOK), 20, 'FaceColor', colEmpty, ...
+                    'EdgeColor', 'none', 'FaceAlpha', 0.6, 'Normalization', 'probability');
+            end
+            if any(sOK)
+                histogram(sVars{ir}(sOK), 20, 'FaceColor', colSpecimen, ...
+                    'EdgeColor', 'none', 'FaceAlpha', 0.6, 'Normalization', 'probability');
+            end
+            xlabel(corrNames{ir});
+            if ir == 1, ylabel('Prob.'); end
+        else
+            % Off-diagonal: scatter
+            eOK = ~isnan(eVars{ic}) & ~isnan(eVars{ir});
+            sOK = ~isnan(sVars{ic}) & ~isnan(sVars{ir});
+            if any(eOK)
+                scatter(eVars{ic}(eOK), eVars{ir}(eOK), 8, colEmpty, ...
+                    'filled', 'MarkerFaceAlpha', 0.25);
+            end
+            if any(sOK)
+                scatter(sVars{ic}(sOK), sVars{ir}(sOK), 8, colSpecimen, ...
+                    'filled', 'MarkerFaceAlpha', 0.25);
+            end
+            if ir == Nv, xlabel(corrNames{ic}); end
+            if ic == 1, ylabel(corrNames{ir}); end
+        end
+        grid on; box on;
+        set(gca, 'FontSize', 7);
+    end
+end
+
+sgtitle({'Pairwise correlations: per-IR × per-band observations', ...
+    sprintf('(blue = empty, red = specimen  |  %d + %d IRs × %d bands)', ...
+    NEmpty, NSpecimen, NDispBands)}, ...
+    'FontSize', 11, 'FontWeight', 'bold');
+
+%--------------------------------------------------------------------------
+%  Figure 8 — PER-IR STRIP PLOT (jittered dots, multiple metrics)
+%
+%   Each column = a frequency band.  Jittered dots show per-IR values.
+%   Side-by-side panels for T60, C80, mode count.  The sheer density of
+%   dots is the visual argument for sample size.
+%--------------------------------------------------------------------------
+hFig8 = figure('Name', 'Per-IR strip plot', ...
+    'Color', 'w', 'Position', [50 50 1400 750]);
+
+stripNames  = {'T_{60} (s)', 'C_{80} (dB)', 'Mode count'};
+eMats_strip = {emptyT60mat,    emptyC80mat,    emptyNmodesMat};
+sMats_strip = {specimenT60mat, specimenC80mat, specimenNmodesMat};
+
+xPos8 = 1 : NDispBands;
+xLab8 = arrayfun(@(f) sprintf('%.0f', f), dispCentres, 'UniformOutput', false);
+jitAmp = 0.15;   % jitter half-width in x
+
+for im = 1 : 3
+    subplot(1, 3, im);
+    hold on;
+
+    eM = eMats_strip{im};
+    sM = sMats_strip{im};
+
+    % Empty (shifted left)
+    for ib = 1 : NDispBands
+        vals = eM(:, ib);
+        ok   = ~isnan(vals);
+        if any(ok)
+            jit = (rand(nnz(ok), 1) - 0.5) * 2 * jitAmp;
+            scatter(xPos8(ib) - 0.2 + jit, vals(ok), 12, colEmpty, ...
+                'filled', 'MarkerFaceAlpha', 0.35, 'HandleVisibility', 'off');
+        end
+    end
+    % Specimen (shifted right)
+    for ib = 1 : NDispBands
+        vals = sM(:, ib);
+        ok   = ~isnan(vals);
+        if any(ok)
+            jit = (rand(nnz(ok), 1) - 0.5) * 2 * jitAmp;
+            scatter(xPos8(ib) + 0.2 + jit, vals(ok), 12, colSpecimen, ...
+                'filled', 'MarkerFaceAlpha', 0.35, 'HandleVisibility', 'off');
+        end
+    end
+
+    % Means
+    eMean = mean(eM, 1, 'omitnan');
+    sMean = mean(sM, 1, 'omitnan');
+    plot(xPos8 - 0.2, eMean, 'o-', 'Color', colEmpty, ...
+        'MarkerFaceColor', colEmpty, 'MarkerSize', 5, 'LineWidth', 1.8, ...
+        'DisplayName', 'Empty mean');
+    plot(xPos8 + 0.2, sMean, 's-', 'Color', colSpecimen, ...
+        'MarkerFaceColor', colSpecimen, 'MarkerSize', 5, 'LineWidth', 1.8, ...
+        'DisplayName', 'Specimen mean');
+
+    set(gca, 'XTick', xPos8, 'XTickLabel', xLab8);
+    xtickangle(60);
+    xlabel('f_c (Hz)');  ylabel(stripNames{im});
+    grid on;  box on;
+    legend('show', 'Location', 'best', 'FontSize', 8);
+    title(stripNames{im}, 'FontSize', 11, 'FontWeight', 'bold');
+end
+
+sgtitle(sprintf('Per-IR measurements  (each dot = 1 IR)  —  %d empty + %d specimen', ...
+    NEmpty, NSpecimen), 'FontSize', 12, 'FontWeight', 'bold');
 
 %% ============================== SAVE =====================================
 
@@ -425,13 +853,15 @@ if ~exist(specimenSubDir,'dir'), mkdir(specimenSubDir);end
 
 % --- Figures (always regenerated) -----------------------------------------
 figNames   = {'fig1_T60distributions.fig', 'fig2_T60spaghetti.fig', ...
-              'fig3_T60comparison.fig'};
-figHandles = {hFig1, hFig2, hFig3};
-for iF = 1 : 3
+              'fig3_T60comparison.fig',   'fig4_spaghettiOverlay.fig', ...
+              'fig5_heatmapGrid.fig',     'fig6_radarConsistency.fig', ...
+              'fig7_correlationMatrix.fig','fig8_stripPlot.fig'};
+figHandles = {hFig1, hFig2, hFig3, hFig4, hFig5, hFig6, hFig7, hFig8};
+for iF = 1 : numel(figNames)
     savefig(figHandles{iF}, fullfile(outDir, figNames{iF}));
 end
 fprintf('\nFigures saved:\n');
-for iF = 1 : 3
+for iF = 1 : numel(figNames)
     fprintf('  %s\n', fullfile(outDir, figNames{iF}));
 end
 
@@ -469,6 +899,14 @@ if ~skipSynthesis
     compS.specimenMeanT60   = specimenMeanT60;compS.specimenStdT60    = specimenStdT60;
     compS.emptyMeanAIT20    = emptyMeanAIT20; compS.emptyStdAIT20     = emptyStdAIT20;
     compS.specimenMeanAIT20 = specimenMeanAIT20; compS.specimenStdAIT20 = specimenStdAIT20;
+    compS.emptyAIT20mat     = emptyAIT20mat;  compS.specimenAIT20mat  = specimenAIT20mat;
+    compS.emptyC80mat       = emptyC80mat;    compS.specimenC80mat    = specimenC80mat;
+    compS.emptyNmodesMat    = emptyNmodesMat; compS.specimenNmodesMat = specimenNmodesMat;
+    compS.emptyDensMat      = emptyDensMat;   compS.specimenDensMat   = specimenDensMat;
+    compS.emptyBR           = emptyBR;        compS.specimenBR        = specimenBR;
+    compS.emptyTR           = emptyTR;        compS.specimenTR        = specimenTR;
+    compS.emptyTs           = emptyTs;        compS.specimenTs        = specimenTs;
+    compS.emptyNRMSE        = emptyNRMSE;     compS.specimenNRMSE     = specimenNRMSE;
     compS.emptyBasisT60     = emptyBasisT60;  compS.specimenBasisT60  = specimenBasisT60;
     compS.dispEdges         = dispEdges;      compS.dispCentres       = dispCentres;
     compS.fTransition       = fTransition;
@@ -501,12 +939,12 @@ fprintf('Output folder : %s\n', outDir);
 % =========================================================================
 
 function data = loadConditionMats(folder, verbose)
-%LOADCONDITIONMATS  Load all *_polymaxRIR.mat files from FOLDER.
+%LOADCONDITIONMATS  Load all *_modalRIR.mat files from FOLDER.
 
-matFiles = dir(fullfile(folder, '*_polymaxRIR.mat'));
+matFiles = dir(fullfile(folder, '*_modalRIR.mat'));
 if isempty(matFiles)
     error('analyseResults:noMats', ...
-        'No *_polymaxRIR.mat files found in ''%s''.', folder);
+        'No *_modalRIR.mat files found in ''%s''.', folder);
 end
 N = numel(matFiles);
 if verbose
@@ -784,6 +1222,71 @@ end
 
 % -------------------------------------------------------------------------
 
+function C80mat = extractC80matrix(dataArray, dispEdges, dispCentres, NDispBands)
+%EXTRACTC80MATRIX  NFiles × NDispBands matrix of acoustic-indices C80.
+%
+%   Maps each file's refAI.C80 values to the display bands by matching
+%   AI band centres to display band centres in log-frequency.
+
+NFiles = numel(dataArray);
+C80mat = nan(NFiles, NDispBands);
+
+for iF = 1 : NFiles
+    ai_fc  = dataArray(iF).refAI.bandCentersHz(:);
+    ai_C80 = dataArray(iF).refAI.C80(:);
+    for ib = 1 : NDispBands
+        [~, idx] = min(abs(log2(ai_fc / max(dispCentres(ib), eps))));
+        if ~isempty(idx) && ~isnan(ai_C80(idx))
+            C80mat(iF, ib) = ai_C80(idx);
+        end
+    end
+end
+end
+
+% -------------------------------------------------------------------------
+
+function Nmat = extractModeCountMatrix(dataArray, dispEdges, NDispBands)
+%EXTRACTMODECOUNTMATRIX  NFiles × NDispBands matrix of pole counts.
+%
+%   Entry (i,k) = number of poles from file i whose frequency falls in
+%   display band k.
+
+NFiles = numel(dataArray);
+Nmat   = zeros(NFiles, NDispBands);
+
+for iF = 1 : NFiles
+    fAllF = dataArray(iF).fAll(:);
+    for ib = 1 : NDispBands
+        Nmat(iF, ib) = nnz((fAllF >= dispEdges(ib)) & (fAllF < dispEdges(ib + 1)));
+    end
+end
+end
+
+% -------------------------------------------------------------------------
+
+function [BR, TR, Ts, nrmse] = extractScalarMetrics(dataArray)
+%EXTRACTSCALARMETRICS  Per-IR scalar metrics: BR, TR, Ts, nRMSE.
+
+NFiles = numel(dataArray);
+BR     = nan(NFiles, 1);
+TR     = nan(NFiles, 1);
+Ts     = nan(NFiles, 1);
+nrmse  = nan(NFiles, 1);
+
+for iF = 1 : NFiles
+    if isfield(dataArray(iF).refAI, 'BR'),  BR(iF) = dataArray(iF).refAI.BR;  end
+    if isfield(dataArray(iF).refAI, 'TR'),  TR(iF) = dataArray(iF).refAI.TR;  end
+    if isfield(dataArray(iF).refAI, 'Ts'),  Ts(iF) = dataArray(iF).refAI.Ts;  end
+    if isfield(dataArray(iF), 'nRMSE_final')
+        nrmse(iF) = dataArray(iF).nRMSE_final;
+    elseif isfield(dataArray(iF), 'nRMSE_IIR')
+        nrmse(iF) = dataArray(iF).nRMSE_IIR;
+    end
+end
+end
+
+% -------------------------------------------------------------------------
+
 function basisT60 = basisT60perBand(basis, dispEdges, NDispBands)
 %BASIST60PERBAND  Mean T60 of common-basis poles per display band.
 
@@ -837,7 +1340,7 @@ fS_match = fS_match(:);  cS_match = cS_match(:);
 end
 
 % =========================================================================
-%  Signal processing utilities  (copied from polymaxRIR.m)
+%  Signal processing utilities  (copied from modalRIR.m)
 % =========================================================================
 
 function [edges, fc] = buildISOBands(fLow, fHigh, bandMode)

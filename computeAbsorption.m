@@ -1,7 +1,7 @@
 %==========================================================================
 % computeAbsorption.m
 %==========================================================================
-% Sound absorption coefficient of a specimen from polymaxRIR comparison
+% Sound absorption coefficient of a specimen from modalRIR comparison
 % results, combining per-mode modal estimates (LF) and Sabine band estimates
 % (HF) into a single wideband α curve.
 %
@@ -61,8 +61,8 @@ clear; close all; clc;
 %% ========================== USER PARAMETERS ==============================
 
 % --- Paths ----------------------------------------------------------------
-compMatPath = './polymaxRIR_results/comparison/comparison.mat';
-outDir      = './polymaxRIR_results/comparison';
+compMatPath = './modalRIR_results/comparison/comparison.mat';
+outDir      = './modalRIR_results/comparison';
 
 % --- Room and specimen geometry -------------------------------------------
 %   V_room    : room volume [m³]
@@ -359,14 +359,14 @@ end
 %       ΔA    = 55.3 · V / c  · (1/T60_S − 1/T60_E)
 %       α_HF  = ΔA / S_spec
 %
-%   Done twice: once with PolyMax T60 (emptyMeanT60/specimenMeanT60) and
-%   once with AI T20 (emptyMeanAIT20/specimenMeanAIT20).  The PolyMax
+%   Done twice: once with modal T60 (emptyMeanT60/specimenMeanT60) and
+%   once with AI T20 (emptyMeanAIT20/specimenMeanAIT20).  The modal
 %   estimate uses the modal damping directly; the AI T20 is the ISO-style
 %   Schroeder estimate for cross-validation.
 
 K = 55.3 * V_room / c_sound;   % Sabine constant [m³·s / m] = [m²·s]
 
-% --- PolyMax-based ---
+% --- modal-based ---
 alphaHF_PM     = nan(1, NDispBands);
 alphaHF_PM_std = nan(1, NDispBands);
 for ib = 1 : NDispBands
@@ -399,7 +399,7 @@ alphaHF_AI = alphaAI;   % keep for backward-compat in saved struct
 %% ============= COMBINE LF + HF INTO FINAL α CURVE =======================
 %
 %   Below fTransition : use per-mode weighted estimate (LF modal method)
-%   Above fTransition : use Sabine PolyMax T60 (HF diffuse method)
+%   Above fTransition : use Sabine modal T60 (HF diffuse method)
 %   Std is taken from whichever regime applies.
 
 alphaFinal     = nan(1, NDispBands);
@@ -475,13 +475,13 @@ if any(hasLFm)
         'DisplayName', 'LF — median \Deltac  (basis only)');
 end
 
-% HF: PolyMax Sabine
+% HF: modal Sabine
 hasHF = ~isnan(alphaHF_PM) & (dispCentres >= fTransition);
 if any(hasHF)
     errorbar(dispCentres(hasHF), alphaHF_PM(hasHF), alphaHF_PM_std(hasHF), ...
         's-', 'Color', colHF, 'MarkerFaceColor', colHF, ...
         'MarkerSize', 7, 'LineWidth', 1.8, 'CapSize', 6, ...
-        'DisplayName', 'HF — Sabine / PolyMax T_{60}  (mean \pm 1\sigma)');
+        'DisplayName', 'HF — Sabine / modal T_{60}  (mean \pm 1\sigma)');
 end
 
 % LF: WLS (blue, main result)
@@ -597,11 +597,11 @@ fprintf('\n=== DONE ===\n');
 %% ========================= LOCAL FUNCTION ================================
 
 function data = loadConditionMats(folder, verbose)
-%LOADCONDITIONMATS  Load all *_polymaxRIR.mat files from FOLDER.
-matFiles = dir(fullfile(folder, '*_polymaxRIR.mat'));
+%LOADCONDITIONMATS  Load all *_modalRIR.mat files from FOLDER.
+matFiles = dir(fullfile(folder, '*_modalRIR.mat'));
 if isempty(matFiles)
     error('computeAbsorption:noMats', ...
-        'No *_polymaxRIR.mat files found in ''%s''.', folder);
+        'No *_modalRIR.mat files found in ''%s''.', folder);
 end
 N = numel(matFiles);
 if verbose
