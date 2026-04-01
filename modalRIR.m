@@ -1663,7 +1663,7 @@ for ib = 1 : NBands
     mSpVec(ib)   = s.meanSpacing_Hz;
     sSpVec(ib)   = s.stdSpacing_Hz;
     cvSpVec(ib)  = s.cvSpacing;
-    poleStats(ib).densityRatio = denRatio(ib);  %#ok<NASGU>  (caller sees poleStats, not ib-indexed)
+    poleStats(ib).densityRatio = denRatio(ib);  %  (caller sees poleStats, not ib-indexed)
 end
 
 gStats.fcVec    = fcVec;
